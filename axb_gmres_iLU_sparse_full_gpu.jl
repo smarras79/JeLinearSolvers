@@ -55,7 +55,7 @@ struct FullyGPUILU{T,TM}
 end
 
 function FullyGPUILU(L_cpu::SparseMatrixCSC{T}, U_cpu::SparseMatrixCSC{T}; 
-                     jacobi_iters=10, omega=T(0.8)) where T
+                     jacobi_iters=100, omega=T(0.9)) where T
     n = size(L_cpu, 1)
     
     # Fix any zero diagonals
