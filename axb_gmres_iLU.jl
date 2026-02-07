@@ -8,12 +8,12 @@ const PREC = Float32
 
 Random.seed!(42)
 n = 100
-nnz = 200
+num_nonzeros = 200
 
 # Create SPD matrix
-rows = rand(1:n, nnz)
-cols = rand(1:n, nnz)
-vals = rand(PREC, nnz)
+rows = rand(1:n, num_nonzeros)
+cols = rand(1:n, num_nonzeros)
+vals = rand(PREC, num_nonzeros)
 A_temp = sparse(rows, cols, vals, n, n)
 A_cpu = A_temp + A_temp' + PREC(20.0) * spdiagm(0 => ones(PREC, n))
 
