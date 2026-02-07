@@ -4,6 +4,49 @@ using IncompleteLU, Krylov
 using Printf
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
+function create_convection_diffusion(n, PREC)
+    """Convection-diffusion: harder problem that benefits from ILU"""
+    nx = ny = Int(sqrt(n))
+    actual_n = nx * ny
+    
+    rows = Int[]
+    cols = Int[]
+    vals = PREC[]
+    
+    # Convection velocity
+    cx, cy = PREC(10.0), PREC(10.0)
+    h = PREC(1.0) / nx
+    
+    for j in 1:ny
+        for i in 1:nx
+            k = i + (j-1)*nx
+            
+            # Diagonal (diffusion + stabilization)
+            push!(rows, k); push!(cols, k); push!(vals, PREC(4.0)/h^2 + abs(cx)/h + abs(cy)/h)
+            
+            # Convection-diffusion stencil
+            if i > 1
+                push!(rows, k); push!(cols, k-1); push!(vals, -PREC(1.0)/h^2 - cx/(2*h))
+            end
+            if i < nx
+                push!(rows, k); push!(cols, k+1); push!(vals, -PREC(1.0)/h^2 + cx/(2*h))
+            end
+            if j > 1
+                push!(rows, k); push!(cols, k-nx); push!(vals, -PREC(1.0)/h^2 - cy/(2*h))
+            end
+            if j < ny
+                push!(rows, k); push!(cols, k+nx); push!(vals, -PREC(1.0)/h^2 + cy/(2*h))
+            end
+        end
+    end
+    
+    A = sparse(rows, cols, vals, actual_n, actual_n)
+    x_true = ones(PREC, actual_n)
+    b = A * x_true
+    
+    return A, b, x_true, actual_n
+end
+
 function create_2d_laplacian(n, PREC)
     nx = ny = Int(sqrt(n))
     actual_n = nx * ny
@@ -271,7 +314,9 @@ results = Dict()
 for PREC in [Float64, Float32, Float16]
     Random.seed!(42)
     
-    A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+    #A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+
+    A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
     
     result = solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     results[PREC] = result
