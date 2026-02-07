@@ -2,6 +2,8 @@ using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
 using Printf
+using Dates
+using JSON
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
 function create_convection_diffusion(n, PREC)
@@ -195,7 +197,7 @@ function LinearAlgebra.ldiv!(y, P::FullyGPUILU, x)
 end
 
 # ===== MIXED PRECISION ILU SOLVER =====
-function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC)
+function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     n = length(b_cpu)
     
     println("\n" * "="^70)
@@ -236,10 +238,6 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC)
     b_gpu = CuArray(b_cpu)
     
     # Build fully GPU ILU preconditioner
-    # Adjust jacobi_iters and omega for accuracy vs speed tradeoff
-    jacobi_iters = 10  # More iterations = better approximation but slower
-    omega = PREC(0.8)  # Damping factor (0.7-0.9 usually works well)
-    
     P = FullyGPUILU(L_cpu, U_cpu, jacobi_iters=jacobi_iters, omega=omega)
     
     println("  ✓ Fully GPU ILU preconditioner built")
@@ -333,11 +331,18 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC)
         noprecond_iters = stats_noprecond.niter,
         noprecond_time = t_noprecond,
         noprecond_error = err_noprecond,
+        noprecond_converged = stats_noprecond.solved,
         ilu_iters = stats_ilu.niter,
         ilu_time = t_ilu,
         ilu_error = err_ilu,
+        ilu_converged = stats_ilu.solved,
         iter_reduction = iter_reduction,
-        time_speedup = time_speedup
+        time_speedup = time_speedup,
+        matrix_size = n,
+        matrix_nnz = nnz_A,
+        ilu_nnz = nnz_L + nnz_U,
+        jacobi_iters = jacobi_iters,
+        omega = omega
     )
 end
 
@@ -347,16 +352,28 @@ println("FULLY GPU ILU PRECONDITIONING - MIXED PRECISION STUDY")
 println("="^70)
 
 n = 10000  # 100×100 grid
+problem_type = "convection_diffusion"  # or "laplacian"
+
+# GPU-specific parameters
+jacobi_iters = 100  # Increase for better accuracy (10, 50, 100)
+omega = 0.9         # Damping factor (0.7-0.9)
+
+println("\nGPU Solver Parameters:")
+println("  Jacobi iterations: $jacobi_iters")
+println("  Omega (damping): $omega")
 
 results = Dict()
 
 for PREC in [Float64, Float32, Float16]
     Random.seed!(42)
     
-    #A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
-    A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+    if problem_type == "laplacian"
+        A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+    else
+        A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+    end
     
-    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC)
+    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega))
     results[PREC] = result
     
     println()
@@ -392,3 +409,46 @@ println("• Triangular solve: Damped Jacobi iteration (GPU-parallelizable)")
 println("• No CPU/GPU transfers during GMRES iterations")
 println("• Trade-off: Approximate triangular solve vs GPU parallelism")
 println("="^70)
+
+# ===== EXPORT RESULTS FOR PDF GENERATION =====
+println("\n" * "="^70)
+println("GENERATING PDF REPORT...")
+println("="^70)
+
+# Prepare data for Python PDF generation
+results_data = Dict(
+    "metadata" => Dict(
+        "date" => string(Dates.now()),
+        "problem_type" => problem_type,
+        "problem_size" => n,
+        "grid_size" => "$(Int(sqrt(n)))×$(Int(sqrt(n)))",
+        "method" => "Fully GPU ILU",
+        "jacobi_iters" => jacobi_iters,
+        "omega" => omega
+    ),
+    "results" => Dict(
+        string(PREC) => Dict(
+            "noprecond_iters" => r.noprecond_iters,
+            "noprecond_time" => r.noprecond_time * 1000,  # Convert to ms
+            "noprecond_error" => r.noprecond_error,
+            "noprecond_converged" => r.noprecond_converged,
+            "ilu_iters" => r.ilu_iters,
+            "ilu_time" => r.ilu_time * 1000,  # Convert to ms
+            "ilu_error" => r.ilu_error,
+            "ilu_converged" => r.ilu_converged,
+            "iter_reduction" => r.iter_reduction,
+            "time_speedup" => r.time_speedup,
+            "matrix_size" => r.matrix_size,
+            "matrix_nnz" => r.matrix_nnz,
+            "ilu_nnz" => r.ilu_nnz
+        ) for (PREC, r) in results
+    )
+)
+
+# Save to JSON for Python script
+open("results_fullgpu.json", "w") do f
+    JSON.print(f, results_data, 2)
+end
+
+println("Results saved to results_fullgpu.json")
+println("Calling Python PDF generator...")

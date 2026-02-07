@@ -4,8 +4,30 @@ using IncompleteLU, Krylov
 using Printf
 using Dates
 using JSON
+using MatrixMarket
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
+function load_system_from_files(path_A, path_b, path_x, PREC)
+    # 1. Read the Sparse Matrix A
+    A_raw = MatrixMarket.mmread(path_A)
+    rows, cols, vals = findnz(A_raw)
+    actual_n = size(A_raw, 1)
+    
+    # Force conversion to desired precision
+    A = sparse(rows, cols, Vector{PREC}(vals), actual_n, actual_n)
+
+    # 2. Read vector b (stored as Nx1 Matrix) and flatten to Vector
+    b_raw = MatrixMarket.mmread(path_b)
+    b = Vector{PREC}(vec(b_raw))
+
+    # 3. Read vector x_true (stored as Nx1 Matrix) and flatten to Vector
+    x_raw = MatrixMarket.mmread(path_x)
+    x_true = Vector{PREC}(vec(x_raw))
+
+    return A, b, x_true, actual_n
+end
+
+
 function create_convection_diffusion(n, PREC)
     """Convection-diffusion: harder problem that benefits from ILU"""
     nx = ny = Int(sqrt(n))
@@ -315,7 +337,7 @@ println("GPU-Accelerated Sparse Linear Solver")
 println("="^70)
 
 n = 10000  # 100×100 grid
-problem_type = "convection_diffusion"  # or "laplacian"
+problem_type = "readdata" # "advdiff"  # or "laplacian"
 
 results = Dict()
 
@@ -324,8 +346,15 @@ for PREC in [Float64, Float32, Float16]
     
     if problem_type == "laplacian"
         A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
-    else
+    elseif  problem_type == "advdiff"
         A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+    elseif problem_type == "readdata"
+        A_cpu, b_cpu, x_true, actual_n = load_system_from_files(
+            "sparse_Abx_data_A.mtx", 
+            "sparse_Abx_data_b.mtx", 
+            "sparse_Abx_data_x.mtx", 
+            PREC
+        )
     end
     
     result = solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
