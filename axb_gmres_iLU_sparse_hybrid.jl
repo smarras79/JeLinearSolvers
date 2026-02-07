@@ -30,43 +30,23 @@ println("Precision: ", PREC)
 # ===== INCOMPLETE LU FACTORIZATION =====
 println("\nComputing ILU...")
 
-# Try different ILU strategies
-ilu_fact = nothing
-strategy = ""
-
-# Strategy 1: ILU(0) - no dropping, most robust
-try
-    ilu_fact = ilu(A_cpu, τ=PREC(0.0))  # No dropping
-    strategy = "ILU(0) - no fill-in"
-    println("✓ Using ILU(0) (no dropping)")
-catch e
-    println("⚠ ILU(0) failed: $e")
-end
-
-# Strategy 2: Small drop tolerance if ILU(0) didn't work
-if isnothing(ilu_fact)
-    try
-        ilu_fact = ilu(A_cpu, τ=PREC(1e-4))  # Very small drop tolerance
-        strategy = "ILU with τ=1e-4"
-        println("✓ Using ILU with τ=1e-4")
-    catch e
-        println("⚠ ILU with τ=1e-4 failed: $e")
-    end
-end
-
-# Strategy 3: Modified ILU with diagonal shift for stability
-if isnothing(ilu_fact)
-    println("⚠ Trying diagonal-shifted ILU...")
-    A_shifted = A_cpu + PREC(1e-6) * sparse(I, n, n)
-    ilu_fact = ilu(A_shifted, τ=PREC(0.0))
-    strategy = "Diagonal-shifted ILU(0)"
-end
+# Try ILU(0) - no dropping, most robust
+ilu_fact = ilu(A_cpu, τ=PREC(0.0))  # No dropping
+strategy = "ILU(0) - no fill-in"
+println("✓ Using ILU(0) (no dropping)")
 
 # Verify diagonal is non-zero
 L_diag = [ilu_fact.L[i,i] for i in 1:n]
 U_diag = [ilu_fact.U[i,i] for i in 1:n]
 
-if any(abs.(L_diag) .< eps(PREC) * 100) || any(abs.(U_diag) .< eps(PREC) * 100)
+min_L_diag = minimum(abs.(L_diag))
+min_U_diag = minimum(abs.(U_diag))
+
+println("\nDiagonal check:")
+println("  Min |L diagonal|: $min_L_diag")
+println("  Min |U diagonal|: $min_U_diag")
+
+if min_L_diag < eps(PREC) * 100 || min_U_diag < eps(PREC) * 100
     error("ILU produced near-zero diagonal entries. Matrix may be ill-conditioned.")
 end
 
@@ -126,10 +106,14 @@ println("\nTesting preconditioner...")
 test_x = CuArray(randn(PREC, n))
 test_y = similar(test_x)
 ldiv!(test_y, P, test_x)
-if any(isnan.(Array(test_y))) || any(isinf.(Array(test_y)))
+test_y_cpu = Array(test_y)
+
+if any(isnan.(test_y_cpu)) || any(isinf.(test_y_cpu))
     error("Preconditioner produces NaN/Inf values!")
 end
 println("✓ Preconditioner test passed")
+println("  Input norm: $(norm(Array(test_x)))")
+println("  Output norm: $(norm(test_y_cpu))")
 
 # Solve
 atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
