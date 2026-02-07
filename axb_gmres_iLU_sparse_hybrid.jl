@@ -2,6 +2,8 @@ using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
 using Printf
+using Dates
+using JSON
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
 function create_convection_diffusion(n, PREC)
@@ -293,11 +295,16 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
         noprecond_iters = stats_noprecond.niter,
         noprecond_time = t_noprecond,
         noprecond_error = err_noprecond,
+        noprecond_converged = stats_noprecond.solved,
         ilu_iters = stats_ilu.niter,
         ilu_time = t_ilu,
         ilu_error = err_ilu,
+        ilu_converged = stats_ilu.solved,
         iter_reduction = iter_reduction,
-        time_speedup = time_speedup
+        time_speedup = time_speedup,
+        matrix_size = n,
+        matrix_nnz = nnz_A,
+        ilu_nnz = nnz_L + nnz_U
     )
 end
 
@@ -308,15 +315,18 @@ println("GPU-Accelerated Sparse Linear Solver")
 println("="^70)
 
 n = 10000  # 100×100 grid
+problem_type = "convection_diffusion"  # or "laplacian"
 
 results = Dict()
 
 for PREC in [Float64, Float32, Float16]
     Random.seed!(42)
     
-    #A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
-
-    A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+    if problem_type == "laplacian"
+        A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+    else
+        A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+    end
     
     result = solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     results[PREC] = result
@@ -353,3 +363,43 @@ println("• ILU(0) preconditioner: Sparse factorization with no fill-in")
 println("• Lower precision → Faster, less memory, acceptable accuracy")
 println("• Hybrid CPU/GPU: ILU solve on CPU, matvec on GPU")
 println("="^70)
+
+# ===== EXPORT RESULTS FOR PDF GENERATION =====
+println("\n" * "="^70)
+println("GENERATING PDF REPORT...")
+println("="^70)
+
+# Prepare data for Python PDF generation
+results_data = Dict(
+    "metadata" => Dict(
+        "date" => string(Dates.now()),
+        "problem_type" => problem_type,
+        "problem_size" => n,
+        "grid_size" => "$(Int(sqrt(n)))×$(Int(sqrt(n)))"
+    ),
+    "results" => Dict(
+        string(PREC) => Dict(
+            "noprecond_iters" => r.noprecond_iters,
+            "noprecond_time" => r.noprecond_time * 1000,  # Convert to ms
+            "noprecond_error" => r.noprecond_error,
+            "noprecond_converged" => r.noprecond_converged,
+            "ilu_iters" => r.ilu_iters,
+            "ilu_time" => r.ilu_time * 1000,  # Convert to ms
+            "ilu_error" => r.ilu_error,
+            "ilu_converged" => r.ilu_converged,
+            "iter_reduction" => r.iter_reduction,
+            "time_speedup" => r.time_speedup,
+            "matrix_size" => r.matrix_size,
+            "matrix_nnz" => r.matrix_nnz,
+            "ilu_nnz" => r.ilu_nnz
+        ) for (PREC, r) in results
+    )
+)
+
+# Save to JSON for Python script
+open("/home/claude/results.json", "w") do f
+    JSON.print(f, results_data, 2)
+end
+
+println("Results saved to results.json")
+println("Calling Python PDF generator...")
