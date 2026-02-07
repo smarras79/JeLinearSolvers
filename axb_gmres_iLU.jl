@@ -1,8 +1,9 @@
-using CUDA, IncompleteLU, Krylov, SparseArrays, LinearAlgebra, Random
+using SparseArrays, LinearAlgebra, Random, CUDA, IncompleteLU, Krylov
 
+# Set random seed for reproducibility
 Random.seed!(42)
-n = 100
-nnz = 200
+n = 100          # Matrix dimension
+nnz = 200        # Number of non-zeros (not dimension!)
 
 # Create symmetric positive definite matrix
 rows = rand(1:n, nnz)
@@ -12,14 +13,19 @@ vals = rand(nnz)
 A_temp = sparse(rows, cols, vals, n, n)
 
 # Make symmetric and positive definite
-A_cpu = A_temp + A_temp' + 20.0I  # I from LinearAlgebra works on sparse
+A_cpu = A_temp + A_temp' + 20.0I  
 
-# Create right-hand side
-x_true = randn(n)
-b_cpu = A_cpu * x_true
+# Create right-hand side - make sure it uses n, not nnz!
+x_true = randn(n)      # Length n = 100
+b_cpu = A_cpu * x_true # Length n = 100
 
-# Compute ILU on CPU (one-time cost)
-ilu_fact = ilu(A_cpu, τ=0.01)  # Adjust τ for sparsity/accuracy tradeoff
+# Verify dimensions
+println("A size: ", size(A_cpu))
+println("b size: ", size(b_cpu))
+println("x_true size: ", size(x_true))
+
+# Compute ILU on CPU
+ilu_fact = ilu(A_cpu, τ=0.01)
 
 # Transfer to GPU
 A_gpu = CuSparseMatrixCSR(A_cpu)
@@ -34,22 +40,17 @@ struct ILUPreconditioner{TL,TU}
     temp::CuVector{Float64}
 end
 
-function ILUPreconditioner(L, U, n)
-    ILUPreconditioner(L, U, CUDA.zeros(n))
-end
-
 function LinearAlgebra.ldiv!(y, P::ILUPreconditioner, x)
-    # Forward solve: L * temp = x
     CUDA.CUSPARSE.sv2!('N', 'L', 'U', 1.0, P.L, x, P.temp, 'O')
-    # Backward solve: U * y = temp  
     CUDA.CUSPARSE.sv2!('N', 'U', 'N', 1.0, P.U, P.temp, y, 'O')
     return y
 end
 
 # Create preconditioner
-P = ILUPreconditioner(L_gpu, U_gpu, length(b_gpu))
+P = ILUPreconditioner(L_gpu, U_gpu, CUDA.zeros(n))
 
 # Solve
-x, stats = gmres(A_gpu, b_gpu, M=P, verbose=1, restart=30, atol=1e-6)
+x_gpu, stats = gmres(A_gpu, b_gpu, M=P, verbose=1, restart=30, atol=1e-6)
 
 println("Converged in $(stats.niter) iterations")
+println("Residual: $(stats.residuals[end])")
