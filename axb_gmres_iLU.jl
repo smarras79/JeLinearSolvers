@@ -1,7 +1,6 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
-using Revise
 
 # ===== SET PRECISION HERE =====
 const PREC = Float32
@@ -29,49 +28,54 @@ println("Precision: ", PREC)
 println("\nComputing ILU(τ=$(PREC(0.01)))...")
 ilu_fact = ilu(A_cpu, τ=PREC(0.01))
 
-# Check sparsity
 nnz_L = SparseArrays.nnz(ilu_fact.L)
 nnz_U = SparseArrays.nnz(ilu_fact.U)
-println("ILU sparsity: L has $nnz_L nnz, U has $nnz_U nnz (full would have $(n*n))")
+println("ILU sparsity: L has $nnz_L nnz, U has $nnz_U nnz (vs $(n*n) for dense)")
 # =======================================
 
-# Transfer to GPU - KEEP SPARSE
-A_gpu = CuSparseMatrixCSC(A_cpu)
+# Transfer to GPU
+A_gpu = CuSparseMatrixCSR(A_cpu)
 b_gpu = CuArray(b_cpu)
-L_gpu_sparse = CuSparseMatrixCSC(ilu_fact.L)
-U_gpu_sparse = CuSparseMatrixCSC(ilu_fact.U)
 
-# Preconditioner with sparse GPU storage
-struct ILUPreconditioner{T,TL,TU}
-    L_sparse::TL
-    U_sparse::TU
-    L_dense::CuArray{T,2}  # For triangular solve
-    U_dense::CuArray{T,2}
-    temp::CuVector{T}
+# Sparse ILU Preconditioner - Hybrid CPU/GPU approach
+# ILU factors stay sparse on CPU, only vectors transferred
+struct SparseILUPreconditioner{T,TL,TU}
+    L_cpu::TL  # Sparse L on CPU
+    U_cpu::TU  # Sparse U on CPU  
+    temp_cpu::Vector{T}
 end
 
-function ILUPreconditioner(L_sparse::TL, U_sparse::TU) where {T,TL<:CuSparseMatrixCSC{T},TU<:CuSparseMatrixCSC{T}}
-    n = size(L_sparse, 1)
-    # Convert to dense only for solve (GPU triangular solve limitation)
-    L_dense = CuArray(Matrix(L_sparse))
-    U_dense = CuArray(Matrix(U_sparse))
-    ILUPreconditioner{T,TL,TU}(L_sparse, U_sparse, L_dense, U_dense, CUDA.zeros(T, n))
+function SparseILUPreconditioner(L_cpu::TL, U_cpu::TU) where {T,TL<:SparseMatrixCSC{T},TU<:SparseMatrixCSC{T}}
+    n = size(L_cpu, 1)
+    SparseILUPreconditioner{T,TL,TU}(L_cpu, U_cpu, Vector{T}(undef, n))
 end
 
-function LinearAlgebra.ldiv!(y, P::ILUPreconditioner, x)
-    # Apply ILU preconditioner: solve (L*U) \ x
-    ldiv!(P.temp, LowerTriangular(P.L_dense), x)
-    ldiv!(y, UpperTriangular(P.U_dense), P.temp)
+function LinearAlgebra.ldiv!(y, P::SparseILUPreconditioner, x)
+    # Transfer GPU -> CPU (only vectors, not matrices)
+    x_cpu = Array(x)
+    
+    # Sparse triangular solves on CPU (fast for sparse L, U)
+    # Forward solve: L \ x
+    ldiv!(P.temp_cpu, LowerTriangular(P.L_cpu), x_cpu)
+    
+    # Backward solve: U \ temp
+    y_cpu = P.U_cpu \ P.temp_cpu
+    
+    # Transfer CPU -> GPU
+    copyto!(y, y_cpu)
     return y
 end
 
-P = ILUPreconditioner(L_gpu_sparse, U_gpu_sparse)
+println("\nBuilding sparse ILU preconditioner (hybrid CPU/GPU)...")
+P = SparseILUPreconditioner(ilu_fact.L, ilu_fact.U)
 
 # Solve
 atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 
-println("\nSolving with ILU-preconditioned GMRES...")
+println("\nSolving with sparse ILU-preconditioned GMRES...")
+println("(ILU stored sparse on CPU, matrix-vector on GPU)")
+
 x_gpu, stats = gmres(A_gpu, b_gpu; 
                      M=P, 
                      ldiv=true,
@@ -82,10 +86,12 @@ x_gpu, stats = gmres(A_gpu, b_gpu;
                      verbose=1,
                      history=true)
 
-println("\n✓ Converged: ", stats.solved)
+println("\n" * "="^50)
+println("✓ Converged: ", stats.solved)
 println("✓ Iterations: ", stats.niter)
 println("✓ Final residual: ", stats.residuals[end])
 
 x_cpu = Array(x_gpu)
 error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)
 println("✓ Relative error: ", error)
+println("="^50)
