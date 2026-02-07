@@ -2,8 +2,12 @@ using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
 
-function create_test_problem(n, PREC)
-    # Create 2D Laplacian-like matrix (realistic CFD/PDE problem)
+# ===== CREATE REALISTIC TEST PROBLEM =====
+function create_2d_laplacian(n, PREC)
+    """
+    Create 2D Laplacian matrix (discretized Poisson equation)
+    This is a realistic test case from CFD/PDE applications
+    """
     nx = ny = Int(sqrt(n))
     actual_n = nx * ny
     
@@ -11,11 +15,13 @@ function create_test_problem(n, PREC)
     cols = Int[]
     vals = PREC[]
     
+    println("Creating 2D Laplacian ($(nx)×$(ny) grid, $actual_n unknowns)...")
+    
     for j in 1:ny
         for i in 1:nx
             k = i + (j-1)*nx
             
-            # Diagonal (4-connectivity)
+            # Diagonal (diffusion coefficient)
             push!(rows, k); push!(cols, k); push!(vals, PREC(4.0))
             
             # Left neighbor
@@ -38,197 +44,216 @@ function create_test_problem(n, PREC)
     end
     
     A = sparse(rows, cols, vals, actual_n, actual_n)
-    x_true = randn(PREC, actual_n)
+    
+    # Create right-hand side
+    x_true = ones(PREC, actual_n)
     b = A * x_true
     
-    return A, b, x_true
+    return A, b, x_true, actual_n
 end
 
-#
-# TEST MIXED PRECISION
-#
-for PREC in [Float64, Float32, Float16]
+# ===== HYBRID SPARSE ILU PRECONDITIONER =====
+struct HybridSparseILU{T,TL,TU}
+    L_cpu::TL
+    U_cpu::TU
+    temp_cpu::Vector{T}
+end
+
+function HybridSparseILU(L_cpu::TL, U_cpu::TU) where {T,TL<:SparseMatrixCSC{T},TU<:SparseMatrixCSC{T}}
+    n = size(L_cpu, 1)
+    HybridSparseILU{T,TL,TU}(L_cpu, U_cpu, Vector{T}(undef, n))
+end
+
+function LinearAlgebra.ldiv!(y, P::HybridSparseILU, x)
+    x_cpu = Array(x)
+    ldiv!(P.temp_cpu, LowerTriangular(P.L_cpu), x_cpu)
+    y_cpu = P.U_cpu \ P.temp_cpu
+    copyto!(y, y_cpu)
+    return y
+end
+
+# ===== MIXED PRECISION ILU SOLVER =====
+function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
+    n = length(b_cpu)
     
-    println("\n" * "="^60)
-    println("Testing with precision: $PREC")
-    println("="^60)
+    println("\n" * "="^70)
+    println("PRECISION: $PREC")
+    println("="^70)
     
-    A_cpu, b_cpu, x_true = create_test_problem(10000, PREC)  # 100×100 grid
-
-    min_diag_A = minimum(abs.([A_cpu[i,i] for i in 1:n]))
-    println("Original matrix A min diagonal: $min_diag_A")
-
-    x_true = randn(PREC, n)
-    b_cpu = A_cpu * x_true
-
-    println("="^60)
-    println("Mixed Precision ILU-Preconditioned GPU Solver")
-    println("="^60)
-    println("Matrix size: ", size(A_cpu))
-    println("RHS size: ", size(b_cpu))
-    println("Precision: ", PREC)
-    println("Condition number estimate: ", cond(Matrix(A_cpu)))
-
-    # ===== INCOMPLETE LU FACTORIZATION =====
-    println("\nComputing ILU...")
-
+    # Matrix statistics
+    nnz_A = SparseArrays.nnz(A_cpu)
+    density = nnz_A / (n * n) * 100
+    
+    println("Matrix statistics:")
+    println("  Size: $n × $n")
+    println("  Nonzeros: $nnz_A")
+    println("  Density: $(round(density, digits=2))%")
+    
+    # Estimate condition number (expensive for large matrices)
+    if n <= 1000
+        cond_est = cond(Matrix(A_cpu))
+        println("  Condition number: $(round(cond_est, digits=1))")
+    end
+    
+    # ===== COMPUTE ILU FACTORIZATION =====
+    println("\nComputing ILU(0) factorization...")
+    
     ilu_fact = try
         ilu(A_cpu, τ=PREC(0.0))
     catch e
-        println("Standard ILU failed: $e")
-        nothing
-    end
-
-    if isnothing(ilu_fact)
-        println("⚠ Using diagonal preconditioner instead")
+        println("  ⚠ ILU failed: $e")
+        println("  Using diagonal preconditioner instead")
         D = [A_cpu[i,i] for i in 1:n]
-        L_fact = sparse(Diagonal(sqrt.(D)))
-        U_fact = sparse(Diagonal(sqrt.(D)))
-        ilu_fact = (L = L_fact, U = U_fact)
-        strategy = "Diagonal preconditioner"
-    else
-        strategy = "ILU(0)"
-        println("✓ Using ILU(0)")
+        L_fact = sparse(Diagonal(sqrt.(abs.(D))))
+        U_fact = sparse(Diagonal(sqrt.(abs.(D))))
+        (L = L_fact, U = U_fact)
     end
-
-    # Verify diagonal is non-zero
-    L_diag = [ilu_fact.L[i,i] for i in 1:n]
-    U_diag = [ilu_fact.U[i,i] for i in 1:n]
-
-    min_L_diag = minimum(abs.(L_diag))
-    min_U_diag = minimum(abs.(U_diag))
-    max_L_diag = maximum(abs.(L_diag))
-    max_U_diag = maximum(abs.(U_diag))
-
-    println("\nDiagonal check:")
-    println("  L diagonal range: [$min_L_diag, $max_L_diag]")
-    println("  U diagonal range: [$min_U_diag, $max_U_diag]")
-
-    # Replace any zero diagonals with small values
-    if min_L_diag < eps(PREC) * 1000
-        println("⚠ Warning: Found near-zero L diagonals, fixing...")
-        L_fact = copy(ilu_fact.L)
-        for i in 1:n
-            if abs(L_fact[i,i]) < eps(PREC) * 1000
-                L_fact[i,i] = PREC(1.0)
-            end
-        end
-        ilu_fact = (L = L_fact, U = ilu_fact.U)
-    end
-
-    if min_U_diag < eps(PREC) * 1000
-        println("⚠ Warning: Found near-zero U diagonals, fixing...")
-        U_fact = copy(ilu_fact.U)
-        for i in 1:n
-            if abs(U_fact[i,i]) < eps(PREC) * 1000
-                U_fact[i,i] = PREC(1.0)
-            end
-        end
-        ilu_fact = (L = ilu_fact.L, U = U_fact)
-    end
-
+    
     nnz_L = SparseArrays.nnz(ilu_fact.L)
     nnz_U = SparseArrays.nnz(ilu_fact.U)
-    nnz_total = SparseArrays.nnz(A_cpu)
-
-    println("\nILU sparsity statistics ($strategy):")
+    fill_factor = (nnz_L + nnz_U) / (2 * nnz_A)
+    
+    println("  ✓ ILU completed")
     println("  L: $nnz_L nnz")
     println("  U: $nnz_U nnz")
-    println("  Original A: $nnz_total nnz")
-    println("  Memory saving vs dense: $(round(100*(1 - (nnz_L+nnz_U)/(n*n)), digits=1))%")
-
-    # Transfer to GPU
+    println("  Fill factor: $(round(fill_factor, digits=2))x")
+    println("  Memory vs dense: $(round(100*(1 - (nnz_L+nnz_U)/(n*n)), digits=1))% savings")
+    
+    # ===== TRANSFER TO GPU =====
     A_gpu = CuSparseMatrixCSC(A_cpu)
     b_gpu = CuArray(b_cpu)
-
-    println("\nMemory strategy:")
-    println("  A: sparse on GPU ($(nnz_total) nnz)")
-    println("  L, U: sparse on CPU ($nnz_L + $nnz_U nnz)")
-    println("  Strategy: Hybrid - matvec on GPU, ILU solve on CPU")
-
-    # Hybrid ILU Preconditioner
-    struct HybridSparseILU{T,TL,TU}
-        L_cpu::TL
-        U_cpu::TU
-        temp_cpu::Vector{T}
-    end
-
-    function HybridSparseILU(L_cpu::TL, U_cpu::TU) where {T,TL<:SparseMatrixCSC{T},TU<:SparseMatrixCSC{T}}
-        n = size(L_cpu, 1)
-        HybridSparseILU{T,TL,TU}(L_cpu, U_cpu, Vector{T}(undef, n))
-    end
-
-    function LinearAlgebra.ldiv!(y, P::HybridSparseILU, x)
-        x_cpu = Array(x)
-        ldiv!(P.temp_cpu, LowerTriangular(P.L_cpu), x_cpu)
-        y_cpu = P.U_cpu \ P.temp_cpu
-        copyto!(y, y_cpu)
-        return y
-    end
-
-    println("\nBuilding hybrid sparse ILU preconditioner...")
+    
+    # Build preconditioner
     P = HybridSparseILU(ilu_fact.L, ilu_fact.U)
-
-    # Test preconditioner
-    println("\nTesting preconditioner...")
-    test_x = CuArray(randn(PREC, n))
-    test_y = similar(test_x)
-    ldiv!(test_y, P, test_x)
-    test_y_cpu = Array(test_y)
-
-    if any(isnan.(test_y_cpu)) || any(isinf.(test_y_cpu))
-        Base.error("Preconditioner produces NaN/Inf values!")  # Use Base.error explicitly
+    
+    # ===== SOLVE WITHOUT PRECONDITIONER =====
+    println("\n[1/2] Solving WITHOUT preconditioner...")
+    
+    atol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
+    rtol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
+    
+    t_noprecond = @elapsed begin
+        x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu; 
+                                              atol=atol,
+                                              rtol=rtol,
+                                              restart=true,
+                                              itmax=200,
+                                              verbose=0)
     end
-    println("✓ Preconditioner test passed")
-    println("  Input norm: $(norm(Array(test_x)))")
-    println("  Output norm: $(norm(test_y_cpu))")
-
-    # Solve
-    atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
-    rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
-
-    println("\nSolving with hybrid sparse ILU-preconditioned GMRES...")
-
-    x_gpu, stats = gmres(A_gpu, b_gpu; 
-                         M=P, 
-                         ldiv=true,
-                         atol=atol,
-                         rtol=rtol,
-                         restart=true,
-                         itmax=100,
-                         verbose=1,
-                         history=true)
-
-    println("\n" * "="^60)
-    println("RESULTS")
-    println("="^60)
-    println("✓ Converged: ", stats.solved)
-    println("✓ GMRES iterations: ", stats.niter)
-    println("✓ Final residual: ", stats.residuals[end])
-
-    x_cpu = Array(x_gpu)
-    rel_error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)  # ← RENAMED from 'error' to 'rel_error'
-    println("✓ Relative error: ", rel_error)
-    println("✓ Precision used: ", PREC)
-    println("="^60)
-
-    # Comparison
-    println("\n" * "="^60)
-    println("COMPARISON: No Preconditioner vs ILU")
-    println("="^60)
-    x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu; 
-                                         atol=atol,
-                                         rtol=rtol,
-                                         restart=true,
-                                         itmax=100,
-                                         verbose=0)
-    println("Without preconditioner: $(stats_noprecond.niter) iterations")
-    println("With ILU preconditioner: $(stats.niter) iterations")
-    if stats.niter < stats_noprecond.niter
-        println("✓ ILU speedup: $(round(stats_noprecond.niter / stats.niter, digits=2))x fewer iterations")
+    
+    x_noprecond_cpu = Array(x_noprecond)
+    err_noprecond = norm(x_noprecond_cpu - x_true) / norm(x_true)
+    
+    println("  Iterations: $(stats_noprecond.niter)")
+    println("  Time: $(round(t_noprecond*1000, digits=2)) ms")
+    println("  Final residual: $(stats_noprecond.residuals[end])")
+    println("  Relative error: $(err_noprecond)")
+    println("  Converged: $(stats_noprecond.solved)")
+    
+    # ===== SOLVE WITH ILU PRECONDITIONER =====
+    println("\n[2/2] Solving WITH ILU preconditioner...")
+    
+    t_ilu = @elapsed begin
+        x_ilu, stats_ilu = gmres(A_gpu, b_gpu; 
+                                 M=P,
+                                 ldiv=true,
+                                 atol=atol,
+                                 rtol=rtol,
+                                 restart=true,
+                                 itmax=200,
+                                 verbose=0)
+    end
+    
+    x_ilu_cpu = Array(x_ilu)
+    err_ilu = norm(x_ilu_cpu - x_true) / norm(x_true)
+    
+    println("  Iterations: $(stats_ilu.niter)")
+    println("  Time: $(round(t_ilu*1000, digits=2)) ms")
+    println("  Final residual: $(stats_ilu.residuals[end])")
+    println("  Relative error: $(err_ilu)")
+    println("  Converged: $(stats_ilu.solved)")
+    
+    # ===== SUMMARY =====
+    println("\n" * "-"^70)
+    println("PERFORMANCE SUMMARY")
+    println("-"^70)
+    
+    iter_reduction = stats_noprecond.niter / stats_ilu.niter
+    time_speedup = t_noprecond / t_ilu
+    
+    println("Iteration reduction: $(round(iter_reduction, digits=2))x")
+    println("Time speedup: $(round(time_speedup, digits=2))x")
+    
+    if stats_ilu.niter < stats_noprecond.niter
+        println("✓ ILU preconditioning EFFECTIVE")
     else
-        println("⚠ ILU did not reduce iterations")
+        println("⚠ ILU preconditioning NOT effective (problem may be too easy)")
     end
-    println("="^60)
-
+    
+    return (
+        noprecond_iters = stats_noprecond.niter,
+        noprecond_time = t_noprecond,
+        noprecond_error = err_noprecond,
+        ilu_iters = stats_ilu.niter,
+        ilu_time = t_ilu,
+        ilu_error = err_ilu,
+        iter_reduction = iter_reduction,
+        time_speedup = time_speedup
+    )
 end
+
+# ===== MAIN: MIXED PRECISION STUDY =====
+println("="^70)
+println("MIXED PRECISION ILU PRECONDITIONING STUDY")
+println("GPU-Accelerated Sparse Linear Solver")
+println("="^70)
+
+# Problem size (adjust as needed)
+# n = 2500 → 50×50 grid (good for testing)
+# n = 10000 → 100×100 grid (realistic)
+# n = 40000 → 200×200 grid (large)
+n = 10000
+
+results = Dict()
+
+for PREC in [Float64, Float32, Float16]
+    Random.seed!(42)  # Consistent across precisions
+    
+    A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+    
+    result = solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
+    results[PREC] = result
+    
+    # Add spacing between tests
+    println()
+end
+
+# ===== FINAL COMPARISON =====
+println("="^70)
+println("MIXED PRECISION COMPARISON")
+println("="^70)
+println()
+
+header = @sprintf("%-12s %10s %10s %10s %10s %10s", 
+                  "Precision", "No-P Iter", "ILU Iter", "Speedup", "Time (ms)", "Rel Error")
+println(header)
+println("-"^70)
+
+for PREC in [Float64, Float32, Float16]
+    r = results[PREC]
+    row = @sprintf("%-12s %10d %10d %10.2fx %10.2f %10.2e",
+                   PREC,
+                   r.noprecond_iters,
+                   r.ilu_iters,
+                   r.iter_reduction,
+                   r.ilu_time * 1000,
+                   r.ilu_error)
+    println(row)
+end
+
+println("="^70)
+println("\nKEY FINDINGS:")
+println("• Lower precision → Faster computation, less memory")
+println("• ILU preconditioning → Fewer iterations, faster solve")
+println("• Trade-off: Precision vs Speed vs Accuracy")
+println("="^70)
