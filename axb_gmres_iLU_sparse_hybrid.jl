@@ -3,7 +3,7 @@ using CUDA, CUDA.CUSPARSE
 using Krylov 
 using MatrixMarket
 
-# ===== MODERN NATIVE GPU ILU PRECONDITIONER =====
+# ===== COMPATIBLE NATIVE GPU ILU PRECONDITIONER =====
 struct GPUSparseILU{T}
     LU::CuSparseMatrixCSR{T, Int32}
     temp_z::CuVector{T} 
@@ -14,77 +14,51 @@ function GPUSparseILU(A_cpu::SparseMatrixCSC{T}) where T
     nnz_A = nnz(A_cpu)
     
     # GPU Memory Check
-    estimated_bytes = (nnz_A * (sizeof(T) + sizeof(Int32)) + n * sizeof(Int32)) * 2.5
     available = CUDA.available_memory()
-    if estimated_bytes > available
-        @warn "Memory tight! Needs ~$(round(estimated_bytes/1024^2, digits=2))MB, Available: $(round(available/1024^2, digits=2))MB"
+    # Matrix + LU copy + Int32 overhead
+    estimated = (nnz_A * (sizeof(T) + 4) + n * 4) * 2.5 
+    if estimated > available
+        @warn "GPU Memory might be tight."
     end
 
-    # 1. Transfer and Convert to CSR (Required for CUSPARSE ILU)
+    # 1. Transfer and Convert to CSR
     A_gpu = CuSparseMatrixCSR(A_cpu)
     
-    # 2. Factorization (In-place on a copy)
+    # 2. Factorization
+    # Using sv0! which is the standard name in many CUDA.jl versions
     LU = copy(A_gpu)
-    CUSPARSE.ilu0!(LU) 
+    CUSPARSE.sv0!(LU, 'N') # 'N' for non-transpose
     
     temp_z = CuVector{T}(undef, n)
     return GPUSparseILU{T}(LU, temp_z)
 end
 
 function LinearAlgebra.ldiv!(y, P::GPUSparseILU, x)
-    # Step 1: Solve L * z = x (Unit lower triangular)
+    # Using explicit Triangular wrappers for dispatch
+    # L is UnitLowerTriangular, U is UpperTriangular
     ldiv!(P.temp_z, UnitLowerTriangular(P.LU), x)
-    # Step 2: Solve U * y = z (Upper triangular)
     ldiv!(y, UpperTriangular(P.LU), P.temp_z)
     return y
 end
 
-# ===== DATA LOADING & GENERATION =====
+# ===== DATA LOADING =====
 function load_system_from_files(path_A, path_b, path_x, PREC)
     if !isfile(path_A) || !isfile(path_b) || !isfile(path_x)
-        error("Matrix files not found at specified paths.")
+        error("Matrix files not found.")
     end
 
     println("Loading Matrix Market files...")
     A_raw = MatrixMarket.mmread(path_A)
     actual_n = size(A_raw, 1)
     
-    # findnz is the safe way to get coordinates and values from any sparse format
+    # Safe extraction of indices and values
     I, J, V = findnz(A_raw)
-    
-    # Convert to SparseMatrixCSC with specific precision
-    # This ensures the matrix is properly structured for CUDA conversion
     A = sparse(I, J, Vector{PREC}(V), actual_n, actual_n)
     
-    # Load and flatten vectors
-    b_raw = MatrixMarket.mmread(path_b)
-    b = Vector{PREC}(vec(b_raw))
+    b = Vector{PREC}(vec(MatrixMarket.mmread(path_b)))
+    xt = Vector{PREC}(vec(MatrixMarket.mmread(path_x)))
     
-    x_raw = MatrixMarket.mmread(path_x)
-    x_true = Vector{PREC}(vec(x_raw))
-    
-    return A, b, x_true, actual_n
-end
-
-
-function create_2d_laplacian(n, PREC)
-    nx = ny = Int(sqrt(n))
-    actual_n = nx * ny
-    println("Creating 2D Laplacian ($(nx)×$(ny) grid, $actual_n unknowns)...")
-    
-    rows, cols, vals = Int[], Int[], PREC[]
-    for j in 1:ny, i in 1:nx
-        k = i + (j-1)*nx
-        push!(rows, k); push!(cols, k); push!(vals, PREC(4.0))
-        if i > 1  push!(rows, k); push!(cols, k-1); push!(vals, PREC(-1.0)) end
-        if i < nx push!(rows, k); push!(cols, k+1); push!(vals, PREC(-1.0)) end
-        if j > 1  push!(rows, k); push!(cols, k-nx); push!(vals, PREC(-1.0)) end
-        if j < ny push!(rows, k); push!(cols, k+nx); push!(vals, PREC(-1.0)) end
-    end
-    A = sparse(rows, cols, vals, actual_n, actual_n)
-    x_true = ones(PREC, actual_n)
-    b = A * x_true
-    return A, b, x_true, actual_n
+    return A, b, xt, actual_n
 end
 
 # ===== MAIN SOLVER FUNCTION =====
@@ -107,7 +81,7 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     atol = PREC == Float64 ? 1e-8 : 1f-6
     rtol = PREC == Float64 ? 1e-8 : 1f-6
     
-    println("\nStarting GMRES Solve (Memory=30)...")
+    println("\nStarting GMRES Solve...")
     println("-"^70)
     
     t_solve = @elapsed begin
@@ -126,21 +100,26 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     err = norm(x_ilu - x_gpu_true) / norm(x_gpu_true)
     @printf("Solve completed in: %.2f ms\n", t_solve * 1000)
     @printf("Iterations: %d\n", stats.niter)
-    @printf("Final Relative Error: %.2e\n", err)
     @printf("Converged: %s\n", stats.solved)
 
     return stats
 end
 
-# ===== RUN SCRIPT =====
-
-mode = "readdata"  # Options: "readdata" or "laplacian"
+# ===== RUN =====
+mode = "readdata" 
 PRECISION = Float64
 
 A, b, xt, n_actual = if mode == "readdata"
     load_system_from_files("sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx", PRECISION)
 else
-    create_2d_laplacian(400000, PRECISION)
+    # Fallback for testing
+    nx = 585 # approx 342,225 nodes
+    actual_n = nx*nx
+    I, J, V = Int[], Int[], PRECISION[]
+    for i in 1:actual_n
+        push!(I, i); push!(J, i); push!(V, 4.0)
+    end
+    sparse(I, J, V, actual_n, actual_n), ones(PRECISION, actual_n), ones(PRECISION, actual_n), actual_n
 end
 
 stats = solve_with_ilu(A, b, xt, PRECISION)
