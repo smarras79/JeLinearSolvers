@@ -16,7 +16,7 @@ matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 
-def load_results(json_file="/home/claude/results.json"):
+def load_results(json_file="./results.json"):
     """Load results from JSON file"""
     with open(json_file, 'r') as f:
         return json.load(f)
@@ -82,10 +82,10 @@ def create_plots(results_data):
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('/home/claude/comparison_plots.png', dpi=300, bbox_inches='tight')
+    plt.savefig('./comparison_plots.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    return '/home/claude/comparison_plots.png'
+    return './comparison_plots.png'
 
 def generate_pdf(results_data, output_file="/mnt/user-data/outputs/ilu_preconditioning_report.pdf"):
     """Generate PDF report"""
