@@ -1,5 +1,4 @@
 using CUDA
-using CUSPARSE
 using CUDAPreconditioners
 using Krylov
 using SparseArrays
