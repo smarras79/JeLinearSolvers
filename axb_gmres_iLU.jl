@@ -1,24 +1,20 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
-using Revise
 
 # ===== SET PRECISION HERE =====
 const PREC = Float32  # Change to Float64, Float32, or Float16
 # ==============================
-const VERBOSE = 1
 
 # Set random seed for reproducibility
 Random.seed!(42)
 n = 100          # Matrix dimension
 nnz = 200        # Number of non-zeros
 
-isverbose = true
-
 # Create symmetric positive definite matrix
 rows = rand(1:n, nnz)
 cols = rand(1:n, nnz)
-vals = rand(PREC, nnz)  # Use specified precision
+vals = rand(PREC, nnz)
 
 A_temp = sparse(rows, cols, vals, n, n)
 
@@ -65,11 +61,20 @@ end
 # Create preconditioner
 P = ILUPreconditioner(L_gpu, U_gpu)
 
-# Solve
-x_gpu, stats = gmres(A_gpu, b_gpu, M=P, VERBOSE, restart=30, atol=PREC(1e-6))
+# Solve - with explicit type conversions
+atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
+rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 
-println("Converged in $(stats.niter) iterations")
-println("Residual: $(stats.residuals[end])")
+x_gpu, stats = gmres(A_gpu, b_gpu; 
+                     M=P, 
+                     atol=atol,
+                     rtol=rtol,
+                     restart=30,
+                     itmax=100)
+
+println("\nConverged: ", stats.solved)
+println("Iterations: ", stats.niter)
+println("Residual: ", stats.residuals[end])
 
 # Verify solution
 x_cpu = Array(x_gpu)
