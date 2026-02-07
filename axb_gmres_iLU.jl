@@ -5,6 +5,7 @@ using IncompleteLU, Krylov
 # ===== SET PRECISION HERE =====
 const PREC = Float32  # Change to Float64, Float32, or Float16
 # ==============================
+const VERBOSE = 1
 
 # Set random seed for reproducibility
 Random.seed!(42)
@@ -71,6 +72,7 @@ x_gpu, stats = gmres(A_gpu, b_gpu;
                      atol=atol,
                      rtol=rtol,
                      restart=true,
+                     verbose=VERBOSE,
                      itmax=100,
                      verbose=1,
                      history=true)
@@ -83,3 +85,4 @@ println("Residual: ", stats.residuals[end])
 x_cpu = Array(x_gpu)
 error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)
 println("Relative error: ", error)
+
