@@ -56,7 +56,7 @@ function load_system_from_files(path_A, path_b, path_x, PREC)
     b = Vector{PREC}(vec(MatrixMarket.mmread(path_b)))
     x_true = Vector{PREC}(vec(MatrixMarket.mmread(path_x)))
     
-    return A, b, x_true
+    return A, b, x_true, actual_n
 end
 
 function create_2d_laplacian(n, PREC)
@@ -76,7 +76,7 @@ function create_2d_laplacian(n, PREC)
     A = sparse(rows, cols, vals, actual_n, actual_n)
     x_true = ones(PREC, actual_n)
     b = A * x_true
-    return A, b, x_true
+    return A, b, x_true, actual_n
 end
 
 # ===== MAIN SOLVER FUNCTION =====
@@ -126,12 +126,10 @@ end
 
 # ===== RUN SCRIPT =====
 
-# CHOOSE MODE: "readdata" or "laplacian"
-mode = "readdata" 
+mode = "readdata"  # Options: "readdata" or "laplacian"
 PRECISION = Float64
 
 A, b, xt, n_actual = if mode == "readdata"
-    # Ensure these filenames match your directory
     load_system_from_files("sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx", PRECISION)
 else
     create_2d_laplacian(400000, PRECISION)
