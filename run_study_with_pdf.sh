@@ -18,7 +18,7 @@ fi
 echo ""
 echo "Step 1: Running Julia simulation..."
 echo "----------------------------------------------------------------------"
-julia ./axb_gmres_iLU_sparse_hybrid.jl
+julia --project-= ./axb_gmres_iLU_sparse_hybrid.jl
 
 # Check if Julia completed successfully
 if [ $? -ne 0 ]; then
@@ -31,7 +31,7 @@ fi
 echo ""
 echo "Step 2: Generating PDF report..."
 echo "----------------------------------------------------------------------"
-python3 /home/claude/generate_pdf_report.py
+python3 ./generate_pdf_report.py
 
 # Check if PDF was generated
 if [ $? -eq 0 ]; then
