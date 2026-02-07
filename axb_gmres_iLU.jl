@@ -1,4 +1,9 @@
-using SparseArrays, LinearAlgebra, Random, CUDA, IncompleteLU, Krylov
+using SparseArrays
+using LinearAlgebra
+using Random
+using CUDA, CUDA.CUSPARSE
+using IncompleteLU
+using Krylov
 
 # Set random seed for reproducibility
 Random.seed!(42)
