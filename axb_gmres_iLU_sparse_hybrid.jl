@@ -49,15 +49,23 @@ function load_system_from_files(path_A, path_b, path_x, PREC)
     A_raw = MatrixMarket.mmread(path_A)
     actual_n = size(A_raw, 1)
     
+    # findnz is the safe way to get coordinates and values from any sparse format
+    I, J, V = findnz(A_raw)
+    
     # Convert to SparseMatrixCSC with specific precision
-    A = sparse(A_raw.row, A_raw.col, Vector{PREC}(A_raw.nzval), actual_n, actual_n)
+    # This ensures the matrix is properly structured for CUDA conversion
+    A = sparse(I, J, Vector{PREC}(V), actual_n, actual_n)
     
     # Load and flatten vectors
-    b = Vector{PREC}(vec(MatrixMarket.mmread(path_b)))
-    x_true = Vector{PREC}(vec(MatrixMarket.mmread(path_x)))
+    b_raw = MatrixMarket.mmread(path_b)
+    b = Vector{PREC}(vec(b_raw))
+    
+    x_raw = MatrixMarket.mmread(path_x)
+    x_true = Vector{PREC}(vec(x_raw))
     
     return A, b, x_true, actual_n
 end
+
 
 function create_2d_laplacian(n, PREC)
     nx = ny = Int(sqrt(n))
