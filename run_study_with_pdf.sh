@@ -18,7 +18,7 @@ fi
 echo ""
 echo "Step 1: Running Julia simulation..."
 echo "----------------------------------------------------------------------"
-julia /home/claude/axb_gmres_iLU_with_pdf.jl
+julia ./axb_gmres_iLU_sparse_hybrid.jl
 
 # Check if Julia completed successfully
 if [ $? -ne 0 ]; then
