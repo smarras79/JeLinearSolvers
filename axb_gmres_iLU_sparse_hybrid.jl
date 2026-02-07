@@ -1,6 +1,7 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
+using Printf
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
 function create_2d_laplacian(n, PREC)
@@ -138,15 +139,20 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
                                               rtol=rtol,
                                               restart=true,
                                               itmax=200,
-                                              verbose=0)
+                                              verbose=0,
+                                              history=true)
     end
     
     x_noprecond_cpu = Array(x_noprecond)
     err_noprecond = norm(x_noprecond_cpu - x_true) / norm(x_true)
     
+    # Safe access to residuals
+    final_res_noprecond = length(stats_noprecond.residuals) > 0 ? 
+                          stats_noprecond.residuals[end] : NaN
+    
     println("  Iterations: $(stats_noprecond.niter)")
     println("  Time: $(round(t_noprecond*1000, digits=2)) ms")
-    println("  Final residual: $(stats_noprecond.residuals[end])")
+    println("  Final residual: $(final_res_noprecond)")
     println("  Relative error: $(err_noprecond)")
     println("  Converged: $(stats_noprecond.solved)")
     
@@ -161,15 +167,20 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
                                  rtol=rtol,
                                  restart=true,
                                  itmax=200,
-                                 verbose=0)
+                                 verbose=0,
+                                 history=true)
     end
     
     x_ilu_cpu = Array(x_ilu)
     err_ilu = norm(x_ilu_cpu - x_true) / norm(x_true)
     
+    # Safe access to residuals
+    final_res_ilu = length(stats_ilu.residuals) > 0 ? 
+                    stats_ilu.residuals[end] : NaN
+    
     println("  Iterations: $(stats_ilu.niter)")
     println("  Time: $(round(t_ilu*1000, digits=2)) ms")
-    println("  Final residual: $(stats_ilu.residuals[end])")
+    println("  Final residual: $(final_res_ilu)")
     println("  Relative error: $(err_ilu)")
     println("  Converged: $(stats_ilu.solved)")
     
@@ -178,8 +189,8 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     println("PERFORMANCE SUMMARY")
     println("-"^70)
     
-    iter_reduction = stats_noprecond.niter / stats_ilu.niter
-    time_speedup = t_noprecond / t_ilu
+    iter_reduction = stats_ilu.niter > 0 ? stats_noprecond.niter / stats_ilu.niter : 1.0
+    time_speedup = t_ilu > 0 ? t_noprecond / t_ilu : 1.0
     
     println("Iteration reduction: $(round(iter_reduction, digits=2))x")
     println("Time speedup: $(round(time_speedup, digits=2))x")
