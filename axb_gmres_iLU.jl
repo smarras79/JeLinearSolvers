@@ -5,7 +5,6 @@ using IncompleteLU, Krylov
 # ===== SET PRECISION HERE =====
 const PREC = Float32  # Change to Float64, Float32, or Float16
 # ==============================
-const VERBOSE = 1
 
 # Set random seed for reproducibility
 Random.seed!(42)
@@ -35,11 +34,11 @@ println("Precision: ", PREC)
 # Compute ILU on CPU
 ilu_fact = ilu(A_cpu, τ=PREC(0.01))
 
-# Transfer to GPU
-A_gpu = CuSparseMatrixCSR(A_cpu)
+# Transfer to GPU - USE CSC instead of CSR for better triangular solve support
+A_gpu = CuSparseMatrixCSC(A_cpu)
 b_gpu = CuArray(b_cpu)
-L_gpu = CuSparseMatrixCSR(ilu_fact.L)
-U_gpu = CuSparseMatrixCSR(ilu_fact.U)
+L_gpu = CuSparseMatrixCSC(ilu_fact.L)
+U_gpu = CuSparseMatrixCSC(ilu_fact.U)
 
 # Generic preconditioner operator
 struct ILUPreconditioner{T,TL,TU}
@@ -48,32 +47,34 @@ struct ILUPreconditioner{T,TL,TU}
     temp::CuVector{T}
 end
 
-function ILUPreconditioner(L::TL, U::TU) where {T,TL<:CuSparseMatrixCSR{T},TU<:CuSparseMatrixCSR{T}}
+function ILUPreconditioner(L::TL, U::TU) where {T,TL<:CuSparseMatrixCSC{T},TU<:CuSparseMatrixCSC{T}}
     n = size(L, 1)
     ILUPreconditioner{T,TL,TU}(L, U, CUDA.zeros(T, n))
 end
 
 function LinearAlgebra.ldiv!(y, P::ILUPreconditioner, x)
-    CUSPARSE.sv2!('N', 'L', 'U', one(eltype(P.L)), P.L, x, P.temp, 'O')
-    CUSPARSE.sv2!('N', 'U', 'N', one(eltype(P.U)), P.U, P.temp, y, 'O')
+    # Forward solve: L \ x -> temp
+    P.temp .= CUSPARSE.sv2('N', 'L', 'U', one(eltype(P.L)), P.L, x, 'O')
+    # Backward solve: U \ temp -> y
+    y .= CUSPARSE.sv2('N', 'U', 'N', one(eltype(P.U)), P.U, P.temp, 'O')
     return y
 end
 
 # Create preconditioner
 P = ILUPreconditioner(L_gpu, U_gpu)
 
-# Solve - MUST SET ldiv=true to use ldiv! instead of mul!
+# Solve
 atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 
 x_gpu, stats = gmres(A_gpu, b_gpu; 
                      M=P, 
-                     ldiv=true,        # ← CRITICAL: Use ldiv! not mul!
+                     ldiv=true,
                      atol=atol,
                      rtol=rtol,
                      restart=true,
-                     verbose=VERBOSE,
                      itmax=100,
+                     verbose=1,
                      history=true)
 
 println("\nConverged: ", stats.solved)
@@ -84,4 +85,3 @@ println("Residual: ", stats.residuals[end])
 x_cpu = Array(x_gpu)
 error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)
 println("Relative error: ", error)
-
