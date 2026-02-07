@@ -11,18 +11,16 @@ n = 100
 num_nonzeros = 200
 
 # Create PROPERLY CONDITIONED SPD matrix
-# Ensure all diagonal entries have values
 rows = rand(1:n, num_nonzeros)
 cols = rand(1:n, num_nonzeros)
-vals = abs.(rand(PREC, num_nonzeros)) .+ PREC(0.1)  # Ensure positive values
+vals = abs.(rand(PREC, num_nonzeros)) .+ PREC(0.1)
 
 A_temp = sparse(rows, cols, vals, n, n)
 
 # Make symmetric and add strong diagonal dominance
-A_cpu = (A_temp + A_temp') / 2  # Symmetric
-A_cpu = A_cpu + PREC(50.0) * spdiagm(0 => ones(PREC, n))  # Strong diagonal dominance
+A_cpu = (A_temp + A_temp') / 2
+A_cpu = A_cpu + PREC(50.0) * spdiagm(0 => ones(PREC, n))
 
-# Verify A is well-conditioned
 min_diag_A = minimum(abs.([A_cpu[i,i] for i in 1:n]))
 println("Original matrix A min diagonal: $min_diag_A")
 
@@ -40,23 +38,18 @@ println("Condition number estimate: ", cond(Matrix(A_cpu)))
 # ===== INCOMPLETE LU FACTORIZATION =====
 println("\nComputing ILU...")
 
-# Use ilu0! which is the standard ILU(0) without dropping
-# This should preserve diagonal entries
 ilu_fact = try
     ilu(A_cpu, τ=PREC(0.0))
 catch e
-    println("Standard ILU failed, trying alternative...")
-    # If standard ILU fails, use simple diagonal preconditioner
+    println("Standard ILU failed: $e")
     nothing
 end
 
 if isnothing(ilu_fact)
     println("⚠ Using diagonal preconditioner instead")
-    # Create dummy L and U for diagonal preconditioner
     D = [A_cpu[i,i] for i in 1:n]
     L_fact = sparse(Diagonal(sqrt.(D)))
     U_fact = sparse(Diagonal(sqrt.(D)))
-    
     ilu_fact = (L = L_fact, U = U_fact)
     strategy = "Diagonal preconditioner"
 else
@@ -77,7 +70,7 @@ println("\nDiagonal check:")
 println("  L diagonal range: [$min_L_diag, $max_L_diag]")
 println("  U diagonal range: [$min_U_diag, $max_U_diag]")
 
-# Replace any zero diagonals with small values to avoid singularity
+# Replace any zero diagonals with small values
 if min_L_diag < eps(PREC) * 1000
     println("⚠ Warning: Found near-zero L diagonals, fixing...")
     L_fact = copy(ilu_fact.L)
@@ -109,9 +102,8 @@ println("  L: $nnz_L nnz")
 println("  U: $nnz_U nnz")
 println("  Original A: $nnz_total nnz")
 println("  Memory saving vs dense: $(round(100*(1 - (nnz_L+nnz_U)/(n*n)), digits=1))%")
-# =======================================
 
-# Transfer matrix to GPU, keep ILU on CPU (hybrid approach)
+# Transfer to GPU
 A_gpu = CuSparseMatrixCSC(A_cpu)
 b_gpu = CuArray(b_cpu)
 
@@ -120,10 +112,10 @@ println("  A: sparse on GPU ($(nnz_total) nnz)")
 println("  L, U: sparse on CPU ($nnz_L + $nnz_U nnz)")
 println("  Strategy: Hybrid - matvec on GPU, ILU solve on CPU")
 
-# Hybrid ILU Preconditioner - SPARSE on CPU
+# Hybrid ILU Preconditioner
 struct HybridSparseILU{T,TL,TU}
-    L_cpu::TL  # Sparse L on CPU
-    U_cpu::TU  # Sparse U on CPU
+    L_cpu::TL
+    U_cpu::TU
     temp_cpu::Vector{T}
 end
 
@@ -133,17 +125,9 @@ function HybridSparseILU(L_cpu::TL, U_cpu::TU) where {T,TL<:SparseMatrixCSC{T},T
 end
 
 function LinearAlgebra.ldiv!(y, P::HybridSparseILU, x)
-    # Transfer GPU -> CPU
     x_cpu = Array(x)
-    
-    # EXACT sparse triangular solves on CPU
-    # Forward solve: L \ x
     ldiv!(P.temp_cpu, LowerTriangular(P.L_cpu), x_cpu)
-    
-    # Backward solve: U \ temp
     y_cpu = P.U_cpu \ P.temp_cpu
-    
-    # Transfer result CPU -> GPU
     copyto!(y, y_cpu)
     return y
 end
@@ -151,7 +135,7 @@ end
 println("\nBuilding hybrid sparse ILU preconditioner...")
 P = HybridSparseILU(ilu_fact.L, ilu_fact.U)
 
-# Test preconditioner before using in GMRES
+# Test preconditioner
 println("\nTesting preconditioner...")
 test_x = CuArray(randn(PREC, n))
 test_y = similar(test_x)
@@ -159,7 +143,7 @@ ldiv!(test_y, P, test_x)
 test_y_cpu = Array(test_y)
 
 if any(isnan.(test_y_cpu)) || any(isinf.(test_y_cpu))
-    error("Preconditioner produces NaN/Inf values!")
+    Base.error("Preconditioner produces NaN/Inf values!")  # Use Base.error explicitly
 end
 println("✓ Preconditioner test passed")
 println("  Input norm: $(norm(Array(test_x)))")
@@ -189,8 +173,8 @@ println("✓ GMRES iterations: ", stats.niter)
 println("✓ Final residual: ", stats.residuals[end])
 
 x_cpu = Array(x_gpu)
-error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)
-println("✓ Relative error: ", error)
+rel_error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)  # ← RENAMED from 'error' to 'rel_error'
+println("✓ Relative error: ", rel_error)
 println("✓ Precision used: ", PREC)
 println("="^60)
 
