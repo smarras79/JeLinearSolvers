@@ -6,6 +6,7 @@ using Revise
 # ===== SET PRECISION HERE =====
 const PREC = Float32  # Change to Float64, Float32, or Float16
 # ==============================
+const VERBOSE = 1
 
 # Set random seed for reproducibility
 Random.seed!(42)
@@ -65,7 +66,7 @@ end
 P = ILUPreconditioner(L_gpu, U_gpu)
 
 # Solve
-x_gpu, stats = gmres(A_gpu, b_gpu, M=P, verbose=isverbose, restart=30, atol=PREC(1e-6))
+x_gpu, stats = gmres(A_gpu, b_gpu, M=P, VERBOSE, restart=30, atol=PREC(1e-6))
 
 println("Converged in $(stats.niter) iterations")
 println("Residual: $(stats.residuals[end])")
