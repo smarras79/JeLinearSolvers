@@ -1,19 +1,18 @@
 using CUDA, IncompleteLU, Krylov, SparseArrays, LinearAlgebra, Random
 
-# Set random seed for reproducibility
 Random.seed!(42)
-
 n = 100
 nnz = 200
 
 # Create symmetric positive definite matrix
-I = rand(1:n, nnz)
-J = rand(1:n, nnz)
-V = rand(nnz)  # Positive values
-A_temp = sparse(I, J, V, n, n)
+rows = rand(1:n, nnz)
+cols = rand(1:n, nnz)
+vals = rand(nnz)
+
+A_temp = sparse(rows, cols, vals, n, n)
 
 # Make symmetric and positive definite
-A_cpu = A_temp + A_temp' + 20.0 * I  # Diagonal dominance
+A_cpu = A_temp + A_temp' + 20.0I  # I from LinearAlgebra works on sparse
 
 # Create right-hand side
 x_true = randn(n)
