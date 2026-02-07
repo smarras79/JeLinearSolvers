@@ -87,7 +87,7 @@ def create_plots(results_data):
     
     return './comparison_plots.png'
 
-def generate_pdf(results_data, output_file="/mnt/user-data/outputs/ilu_preconditioning_report.pdf"):
+def generate_pdf(results_data, output_file="ilu_preconditioning_report.pdf"):
     """Generate PDF report"""
     
     doc = SimpleDocTemplate(output_file, pagesize=letter,
