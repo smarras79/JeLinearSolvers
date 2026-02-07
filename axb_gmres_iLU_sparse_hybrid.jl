@@ -2,8 +2,6 @@ using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
 using Printf
-using Dates
-using JSON
 using MatrixMarket
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
