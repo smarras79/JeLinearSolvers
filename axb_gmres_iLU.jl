@@ -1,40 +1,56 @@
-using CUDA
-using CUDAPreconditioners
-using Krylov
-using SparseArrays
-using Random
+using CUDA, IncompleteLU, Krylov, SparseArrays, LinearAlgebra, Random
 
-function axb_gmres_iLU()
-    
-    # Set random seed for reproducibility
-    Random.seed!(42)
+# Set random seed for reproducibility
+Random.seed!(42)
 
-    n = 100
-    nnz = 200
+n = 100
+nnz = 200
 
-    # Create symmetric positive definite matrix
-    I = rand(1:n, nnz)
-    J = rand(1:n, nnz)
-    V = rand(nnz)  # Positive values
-    A_temp = sparse(I, J, V, n, n)
+# Create symmetric positive definite matrix
+I = rand(1:n, nnz)
+J = rand(1:n, nnz)
+V = rand(nnz)  # Positive values
+A_temp = sparse(I, J, V, n, n)
 
-    # Make symmetric and positive definite
-    A_cpu = A_temp + A_temp' + 20.0 * I  # Diagonal dominance
+# Make symmetric and positive definite
+A_cpu = A_temp + A_temp' + 20.0 * I  # Diagonal dominance
 
-    # Create right-hand side
-    x_true = randn(n)
-    b_cpu = A_cpu * x_true
+# Create right-hand side
+x_true = randn(n)
+b_cpu = A_cpu * x_true
 
-    # Load sparse matrix A and vector b
-    A_gpu = CuSparseMatrixCSR(A)
-    b_gpu = CuVector(b)
+# Compute ILU on CPU (one-time cost)
+ilu_fact = ilu(A_cpu, τ=0.01)  # Adjust τ for sparsity/accuracy tradeoff
 
-    # Compute ILU(0) on GPU
-    # CUDAPreconditioners.jl uses CUSPARSE ilu0
-    P = ilu0(A_gpu)
+# Transfer to GPU
+A_gpu = CuSparseMatrixCSR(A_cpu)
+b_gpu = CuArray(b_cpu)
+L_gpu = CuSparseMatrixCSR(ilu_fact.L)
+U_gpu = CuSparseMatrixCSR(ilu_fact.U)
 
-    # Solve Ax = b using GMRES and the GPU preconditioner
-    x_gpu, stats = gmres(A_gpu, b_gpu, M=P)
+# Preconditioner operator
+struct ILUPreconditioner{TL,TU}
+    L::TL
+    U::TU
+    temp::CuVector{Float64}
 end
 
-axb_gmres_iLU()
+function ILUPreconditioner(L, U, n)
+    ILUPreconditioner(L, U, CUDA.zeros(n))
+end
+
+function LinearAlgebra.ldiv!(y, P::ILUPreconditioner, x)
+    # Forward solve: L * temp = x
+    CUDA.CUSPARSE.sv2!('N', 'L', 'U', 1.0, P.L, x, P.temp, 'O')
+    # Backward solve: U * y = temp  
+    CUDA.CUSPARSE.sv2!('N', 'U', 'N', 1.0, P.U, P.temp, y, 'O')
+    return y
+end
+
+# Create preconditioner
+P = ILUPreconditioner(L_gpu, U_gpu, length(b_gpu))
+
+# Solve
+x, stats = gmres(A_gpu, b_gpu, M=P, verbose=1, restart=30, atol=1e-6)
+
+println("Converged in $(stats.niter) iterations")
