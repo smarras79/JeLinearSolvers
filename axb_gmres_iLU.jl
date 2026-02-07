@@ -13,7 +13,7 @@ vals = rand(nnz)
 A_temp = sparse(rows, cols, vals, n, n)
 
 # Make symmetric and positive definite
-A_cpu = A_temp + A_temp' + 20.0I  
+A_cpu = A_temp + A_temp' + 20.0 * spdiagm(0 => ones(n))
 
 # Create right-hand side - make sure it uses n, not nnz!
 x_true = randn(n)      # Length n = 100
