@@ -1,6 +1,7 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE, CUDA.CUSOLVER
 using IncompleteLU, Krylov
+using Revise
 
 # ===== SET PRECISION HERE =====
 const PREC = Float32
