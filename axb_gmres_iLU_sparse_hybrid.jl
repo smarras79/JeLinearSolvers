@@ -354,7 +354,9 @@ for PREC in [Float64, Float32, Float16]
             PREC
         )
     end
-    
+    @info typeof(A_cpu), typeof(b_cpu), typeof(x_true)
+    @info size(A_cpu), size(b_cpu), size(x_true)
+    @mystop
     result = solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     results[PREC] = result
     
