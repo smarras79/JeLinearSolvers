@@ -44,11 +44,21 @@ println("  Fill ratio: $(round(fill_ratio, digits=2))x")
 println("  Memory saving vs dense: $(round(100*(1 - (nnz_L+nnz_U)/(n*n)), digits=1))%")
 # =======================================
 
+# Extract diagonals on CPU BEFORE transferring to GPU
+L_diag_cpu = [ilu_fact.L[i,i] for i in 1:n]
+U_diag_cpu = [ilu_fact.U[i,i] for i in 1:n]
+L_diag_inv_cpu = PREC(1) ./ L_diag_cpu
+U_diag_inv_cpu = PREC(1) ./ U_diag_cpu
+
 # Transfer to GPU - KEEP SPARSE
 A_gpu = CuSparseMatrixCSC(A_cpu)
 b_gpu = CuArray(b_cpu)
 L_gpu = CuSparseMatrixCSC(ilu_fact.L)
 U_gpu = CuSparseMatrixCSC(ilu_fact.U)
+
+# Transfer precomputed diagonal inverses to GPU
+L_diag_inv_gpu = CuArray(L_diag_inv_cpu)
+U_diag_inv_gpu = CuArray(U_diag_inv_cpu)
 
 println("\nGPU memory allocated:")
 println("  A: sparse CSC ($(SparseArrays.nnz(A_cpu)) nnz)")
@@ -59,15 +69,18 @@ println("  U: sparse CSC ($nnz_U nnz)")
 struct FullySparseGPUILU{T,TM}
     L::TM  # Sparse lower triangular on GPU
     U::TM  # Sparse upper triangular on GPU
+    L_diag_inv::CuVector{T}  # Inverse diagonal of L
+    U_diag_inv::CuVector{T}  # Inverse diagonal of U
     temp::CuVector{T}
     temp2::CuVector{T}
     max_iter::Int  # Iterations for iterative triangular solve
 end
 
-function FullySparseGPUILU(L::TM, U::TM; max_iter=5) where {T,TM<:CuSparseMatrixCSC{T}}
+function FullySparseGPUILU(L::TM, U::TM, L_diag_inv::CuVector{T}, U_diag_inv::CuVector{T}; max_iter=5) where {T,TM<:CuSparseMatrixCSC{T}}
     n = size(L, 1)
     FullySparseGPUILU{T,TM}(
         L, U,
+        L_diag_inv, U_diag_inv,
         CUDA.zeros(T, n),
         CUDA.zeros(T, n),
         max_iter
@@ -75,42 +88,31 @@ function FullySparseGPUILU(L::TM, U::TM; max_iter=5) where {T,TM<:CuSparseMatrix
 end
 
 # Sparse triangular solve using Richardson iteration on GPU
-function solve_lower_triangular!(y, L_sparse, x, max_iter, temp)
+function solve_lower_triangular!(y, L_sparse, L_diag_inv, x, max_iter, temp)
     # Solve L*y = x using Richardson iteration
-    # L = D + L_strict where D is diagonal, L_strict is strictly lower
-    n = length(x)
-    
-    # Extract diagonal of L for preconditioning
-    D_inv = CuArray([1 / L_sparse[i,i] for i in 1:n])
-    
     # Initialize y = D^{-1} * x
-    y .= D_inv .* x
+    y .= L_diag_inv .* x
     
     # Richardson iteration: y^{k+1} = y^k + D^{-1}(x - L*y^k)
     for iter in 1:max_iter
         mul!(temp, L_sparse, y)  # temp = L*y
         temp .= x .- temp         # temp = x - L*y (residual)
-        y .+= D_inv .* temp       # y = y + D^{-1}*residual
+        y .+= L_diag_inv .* temp  # y = y + D^{-1}*residual
     end
     
     return y
 end
 
-function solve_upper_triangular!(y, U_sparse, x, max_iter, temp)
+function solve_upper_triangular!(y, U_sparse, U_diag_inv, x, max_iter, temp)
     # Solve U*y = x using Richardson iteration
-    n = length(x)
-    
-    # Extract diagonal of U for preconditioning
-    D_inv = CuArray([1 / U_sparse[i,i] for i in 1:n])
-    
     # Initialize y = D^{-1} * x
-    y .= D_inv .* x
+    y .= U_diag_inv .* x
     
     # Richardson iteration: y^{k+1} = y^k + D^{-1}(x - U*y^k)
     for iter in 1:max_iter
         mul!(temp, U_sparse, y)  # temp = U*y
         temp .= x .- temp         # temp = x - U*y (residual)
-        y .+= D_inv .* temp       # y = y + D^{-1}*residual
+        y .+= U_diag_inv .* temp  # y = y + D^{-1}*residual
     end
     
     return y
@@ -118,16 +120,16 @@ end
 
 function LinearAlgebra.ldiv!(y, P::FullySparseGPUILU, x)
     # Forward solve: L * temp = x
-    solve_lower_triangular!(P.temp, P.L, x, P.max_iter, P.temp2)
+    solve_lower_triangular!(P.temp, P.L, P.L_diag_inv, x, P.max_iter, P.temp2)
     
     # Backward solve: U * y = temp
-    solve_upper_triangular!(y, P.U, P.temp, P.max_iter, P.temp2)
+    solve_upper_triangular!(y, P.U, P.U_diag_inv, P.temp, P.max_iter, P.temp2)
     
     return y
 end
 
 println("\nBuilding fully sparse GPU ILU preconditioner...")
-P = FullySparseGPUILU(L_gpu, U_gpu, max_iter=5)
+P = FullySparseGPUILU(L_gpu, U_gpu, L_diag_inv_gpu, U_diag_inv_gpu, max_iter=5)
 
 # Solve
 atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
@@ -157,4 +159,19 @@ x_cpu = Array(x_gpu)
 error = norm(A_cpu * x_cpu - b_cpu) / norm(b_cpu)
 println("✓ Relative error: ", error)
 println("✓ Precision used: ", PREC)
+println("="^60)
+
+# Verification: Compare with no preconditioner
+println("\n" * "="^60)
+println("COMPARISON: No Preconditioner")
+println("="^60)
+x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu; 
+                                      atol=atol,
+                                      rtol=rtol,
+                                      restart=true,
+                                      itmax=100,
+                                      verbose=0)
+println("Without ILU: $(stats_noprecond.niter) iterations")
+println("With ILU: $(stats.niter) iterations")
+println("Speedup: $(round(stats_noprecond.niter / stats.niter, digits=2))x reduction in iterations")
 println("="^60)
