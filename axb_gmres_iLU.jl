@@ -74,7 +74,6 @@ x_gpu, stats = gmres(A_gpu, b_gpu;
                      restart=true,
                      verbose=VERBOSE,
                      itmax=100,
-                     verbose=1,
                      history=true)
 
 println("\nConverged: ", stats.solved)
