@@ -397,7 +397,7 @@ results_data = Dict(
 )
 
 # Save to JSON for Python script
-open("/home/claude/results.json", "w") do f
+open("./results.json", "w") do f
     JSON.print(f, results_data, 2)
 end
 
