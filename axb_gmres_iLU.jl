@@ -12,6 +12,8 @@ Random.seed!(42)
 n = 100          # Matrix dimension
 nnz = 200        # Number of non-zeros
 
+isverbose = true
+
 # Create symmetric positive definite matrix
 rows = rand(1:n, nnz)
 cols = rand(1:n, nnz)
@@ -63,7 +65,7 @@ end
 P = ILUPreconditioner(L_gpu, U_gpu)
 
 # Solve
-x_gpu, stats = gmres(A_gpu, b_gpu, M=P, verbose=1, restart=30, atol=PREC(1e-6))
+x_gpu, stats = gmres(A_gpu, b_gpu, M=P, verbose=isverbose, restart=30, atol=PREC(1e-6))
 
 println("Converged in $(stats.niter) iterations")
 println("Residual: $(stats.residuals[end])")
