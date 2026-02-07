@@ -29,8 +29,8 @@ println("Precision: ", PREC)
 println("\nComputing ILU(τ=$(PREC(0.01)))...")
 ilu_fact = ilu(A_cpu, τ=PREC(0.01))
 
-nnz_L = nnz(ilu_fact.L)
-nnz_U = nnz(ilu_fact.U)
+nnz_L = SparseArrays.nnz(ilu_fact.L)
+nnz_U = SparseArrays.nnz(ilu_fact.U)
 println("ILU sparsity: L has $nnz_L nnz, U has $nnz_U nnz")
 # =======================================
 
@@ -64,7 +64,7 @@ function SparseiLUPreconditioner(L::TM, U::TM) where {T,TM<:CuSparseMatrixCSR{T}
     CUSOLVER.cusparseXcsrsv2_bufferSize(
         CUSOLVER.handle(), 
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(L), L, 
+        n, SparseArrays.nnz(L), L, 
         L_info, 
         temp_buffer_L
     )
@@ -72,7 +72,7 @@ function SparseiLUPreconditioner(L::TM, U::TM) where {T,TM<:CuSparseMatrixCSR{T}
     CUSOLVER.cusparseXcsrsv2_analysis(
         CUSOLVER.handle(),
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(L), L,
+        n, SparseArrays.nnz(L), L,
         L_info,
         policy,
         temp_buffer_L
@@ -83,7 +83,7 @@ function SparseiLUPreconditioner(L::TM, U::TM) where {T,TM<:CuSparseMatrixCSR{T}
     CUSOLVER.cusparseXcsrsv2_bufferSize(
         CUSOLVER.handle(),
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(U), U,
+        n, SparseArrays.nnz(U), U,
         U_info,
         temp_buffer_U
     )
@@ -91,7 +91,7 @@ function SparseiLUPreconditioner(L::TM, U::TM) where {T,TM<:CuSparseMatrixCSR{T}
     CUSOLVER.cusparseXcsrsv2_analysis(
         CUSOLVER.handle(),
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(U), U,
+        n, SparseArrays.nnz(U), U,
         U_info,
         policy,
         temp_buffer_U
@@ -108,7 +108,7 @@ function LinearAlgebra.ldiv!(y, P::SparseiLUPreconditioner{T}, x) where T
     CUSOLVER.cusparseXcsrsv2_solve(
         CUSOLVER.handle(),
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(P.L), Ref(alpha),
+        n, SparseArrays.nnz(P.L), Ref(alpha),
         P.L, x, P.temp,
         P.L_info, P.policy
     )
@@ -117,7 +117,7 @@ function LinearAlgebra.ldiv!(y, P::SparseiLUPreconditioner{T}, x) where T
     CUSOLVER.cusparseXcsrsv2_solve(
         CUSOLVER.handle(),
         CUSOLVER.CUSPARSE_OPERATION_NON_TRANSPOSE,
-        n, nnz(P.U), Ref(alpha),
+        n, SparseArrays.nnz(P.U), Ref(alpha),
         P.U, P.temp, y,
         P.U_info, P.policy
     )

@@ -30,8 +30,8 @@ println("\nComputing ILU(τ=$(PREC(0.01)))...")
 ilu_fact = ilu(A_cpu, τ=PREC(0.01))
 
 # Check sparsity
-nnz_L = nnz(ilu_fact.L)
-nnz_U = nnz(ilu_fact.U)
+nnz_L = SparseArrays.nnz(ilu_fact.L)
+nnz_U = SparseArrays.nnz(ilu_fact.U)
 println("ILU sparsity: L has $nnz_L nnz, U has $nnz_U nnz (full would have $(n*n))")
 # =======================================
 
