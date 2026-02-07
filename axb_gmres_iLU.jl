@@ -61,16 +61,19 @@ end
 # Create preconditioner
 P = ILUPreconditioner(L_gpu, U_gpu)
 
-# Solve - with explicit type conversions
+# Solve - MUST SET ldiv=true to use ldiv! instead of mul!
 atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
 
 x_gpu, stats = gmres(A_gpu, b_gpu; 
                      M=P, 
+                     ldiv=true,        # ← CRITICAL: Use ldiv! not mul!
                      atol=atol,
                      rtol=rtol,
-                     restart=30,
-                     itmax=100)
+                     restart=true,
+                     itmax=100,
+                     verbose=1,
+                     history=true)
 
 println("\nConverged: ", stats.solved)
 println("Iterations: ", stats.niter)
