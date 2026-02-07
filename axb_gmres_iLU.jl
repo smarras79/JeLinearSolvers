@@ -5,6 +5,8 @@ using CUDA, CUDA.CUSPARSE
 using IncompleteLU
 using Krylov
 
+const TF = Float64
+
 # Set random seed for reproducibility
 Random.seed!(42)
 n = 100          # Matrix dimension
@@ -52,7 +54,7 @@ function LinearAlgebra.ldiv!(y, P::ILUPreconditioner, x)
 end
 
 # Create preconditioner
-P = ILUPreconditioner(L_gpu, U_gpu, CUDA.zeros(n))
+P = ILUPreconditioner(L_gpu, U_gpu, CUDA.zeros(TF, n))
 
 # Solve
 x_gpu, stats = gmres(A_gpu, b_gpu, M=P, verbose=1, restart=30, atol=1e-6)
