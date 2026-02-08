@@ -215,10 +215,26 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
     @printf("GMRES Solver: %d unknowns | Precision: %s | Preconditioner: %s\n", n, PREC, precond)
     println("="^70)
 
-    # --- 1. GPU TRANSFER ---
+    # --- 1. PREPROCESSING & GPU TRANSFER ---
+    # For ILU: symmetric diagonal equilibration (D*A*D) normalizes diagonal
+    # entries to ~1, which dramatically improves ILU(0) quality.
+    # The solve is exact: D*A*D*y = D*b, then x = D*y recovers original solution.
+    D_equil = nothing
+    if precond == "ilu"
+        println("Applying diagonal equilibration for ILU...")
+        diag_A = diag(A_cpu)
+        d = [PREC(1) / sqrt(abs(val) + eps(PREC)) for val in diag_A]
+        D_equil = sparse(1:n, 1:n, d)
+        A_work = D_equil * A_cpu * D_equil
+        b_work = Vector{PREC}(D_equil * b_cpu)
+    else
+        A_work = A_cpu
+        b_work = b_cpu
+    end
+
     println("Transferring system to GPU...")
-    A_gpu = CuSparseMatrixCSR(A_cpu)
-    b_gpu = CuArray(b_cpu)
+    A_gpu = CuSparseMatrixCSR(A_work)
+    b_gpu = CuArray(b_work)
 
     # --- 2. BUILD PRECONDITIONER ---
     P = if precond == "ilu"
@@ -229,7 +245,7 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
             @printf("  ILU(0) failed on original matrix: %s\n", e)
             epsilon = PREC == Float64 ? 1e-10 : PREC(1e-6)
             @printf("  Retrying with diagonal perturbation eps=%.1e ...\n", epsilon)
-            A_shifted_cpu = A_cpu + epsilon * sparse(PREC(1)*I, n, n)
+            A_shifted_cpu = A_work + epsilon * sparse(PREC(1)*I, n, n)
             A_shifted_gpu = CuSparseMatrixCSR(A_shifted_cpu)
             GPUSparseILU(A_shifted_gpu)
         end
@@ -242,7 +258,8 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
     end
 
     # --- 3. LIVE CONVERGENCE PLOTTING ---
-    p = plot(title="GMRES Convergence (precond: $precond)",
+    p = plot([0], [1.0],
+             title="GMRES Convergence (precond: $precond)",
              xlabel="Iteration", ylabel="Relative Residual",
              yaxis=:log10, label="||r||/||b||", lw=2, grid=true,
              color=:crimson)
@@ -260,6 +277,7 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
                              itmax=2500,
                              atol=1e-8, rtol=1e-8,
                              verbose=1,
+                             history=true,
                              callback = (solver) -> begin
                                  it = solver.stats.niter
                                  if it > 0 && it % 10 == 0 && !isempty(solver.stats.residuals)
@@ -271,8 +289,12 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
                              end)
     end
 
-    # --- 4. RESULTS ---
-    x_cpu = Array(x_gpu)
+    # --- 4. RECOVER SOLUTION ---
+    x_cpu = if D_equil !== nothing
+        D_equil * Array(x_gpu)  # Unscale: x = D * y
+    else
+        Array(x_gpu)
+    end
     savefig("convergence_report.png")
 
     @printf("\nSolve Time: %.2f s | Iterations: %d\n", t_solve, stats.niter)
