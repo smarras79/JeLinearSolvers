@@ -196,48 +196,46 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     @printf("Robust Solver: %d unknowns | Precision: %s\n", n, PREC)
     println("="^70)
 
-    # --- 1. PRE-PROCESSING (Scaling and Shift) ---
-    # Shift prevents zero pivots in ILU; Scaling improves conditioning
-    epsilon = PREC == Float64 ? 1e-9 : 1f-7
-    println("Applying Diagonal Scaling and Shift (ϵ = $epsilon)...")
-    
-    diag_A = diag(A_cpu)
-    # d_i = 1 / sqrt(|A_ii| + epsilon)
-    d = [1.0 / sqrt(abs(val) + epsilon) for val in diag_A]
-    D = sparse(1:n, 1:n, PREC.(d))
-    
-    # Transform: A_scaled = D * (A + epsilon*I) * D
-    A_scaled_cpu = D * (A_cpu + epsilon * I) * D
-    b_scaled_cpu = D * b_cpu
-    
-    # --- 2. GPU TRANSFER & SETUP ---
-    A_gpu = CuSparseMatrixCSR(A_scaled_cpu)
-    b_gpu = CuArray(b_scaled_cpu)
+    # --- 1. GPU TRANSFER ---
+    println("Transferring system to GPU...")
+    A_gpu = CuSparseMatrixCSR(A_cpu)
+    b_gpu = CuArray(b_cpu)
 
-    println("Building GPU-Native ILU(0)...")
-    P = GPUSparseILU(A_gpu)
+    # --- 2. BUILD ILU(0) PRECONDITIONER DIRECTLY ---
+    # Apply CUSPARSE ilu02! on the original matrix (no scaling/shifting).
+    # If ilu02! fails (zero pivot), retry with a minimal diagonal perturbation
+    # applied only to the preconditioner copy — the solve still uses original A.
+    println("Building GPU-Native ILU(0) preconditioner...")
+    P = try
+        GPUSparseILU(A_gpu)
+    catch e
+        @printf("  ILU(0) failed on original matrix: %s\n", e)
+        epsilon = PREC == Float64 ? 1e-10 : PREC(1e-6)
+        @printf("  Retrying with diagonal perturbation eps=%.1e ...\n", epsilon)
+        A_shifted_cpu = A_cpu + epsilon * sparse(PREC(1)*I, n, n)
+        A_shifted_gpu = CuSparseMatrixCSR(A_shifted_cpu)
+        GPUSparseILU(A_shifted_gpu)
+    end
 
     # --- 3. LIVE CONVERGENCE PLOTTING ---
-    p = plot(title="GMRES Convergence (Scaled & Shifted)", 
+    p = plot(title="GMRES Convergence (ILU(0) preconditioned)",
              xlabel="Iteration", ylabel="Relative Residual",
              yaxis=:log10, label="||r||/||b||", lw=2, grid=true,
              color=:crimson)
     display(p)
 
     println("\nStarting GMRES (Restart Memory=150)...")
-    
+
     t_solve = @elapsed begin
-        # We solve the scaled system: (D A D) y = (D b)
-        y_gpu, stats = gmres(A_gpu, b_gpu; 
-                             M=P, ldiv=true, 
-                             restart=true, memory=150, 
-                             itmax=2500, 
+        x_gpu, stats = gmres(A_gpu, b_gpu;
+                             M=P, ldiv=true,
+                             restart=true, memory=150,
+                             itmax=2500,
                              atol=1e-8, rtol=1e-8,
                              verbose=1,
                              callback = (solver) -> begin
                                  it = solver.stats.niter
                                  if it > 0 && it % 10 == 0 && !isempty(solver.stats.residuals)
-                                     # Plot normalized residual
                                      res = solver.stats.residuals[end] / solver.stats.residuals[1]
                                      push!(p, it, res)
                                      gui(p)
@@ -246,11 +244,10 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
                              end)
     end
 
-    # --- 4. RECOVER SOLUTION ---
-    # Original solution x = D * y
-    x_cpu = D * Array(y_gpu)
+    # --- 4. RESULTS ---
+    x_cpu = Array(x_gpu)
     savefig("convergence_report.png")
-    
+
     @printf("\nSolve Time: %.2f s | Iterations: %d\n", t_solve, stats.niter)
     if x_true !== nothing
         err = norm(x_cpu - x_true) / norm(x_true)
@@ -260,7 +257,7 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
         @printf("Final Relative Residual ||Ax-b||/||b||: %.2e\n", res)
     end
     @printf("Solver Status: %s\n", stats.solved ? "CONVERGED" : "FAILED")
-    
+
     return x_cpu, stats
 end
 
