@@ -15,7 +15,7 @@ function GPUSparseILU(A_cpu::SparseMatrixCSC{T}) where T
     A_gpu = CuSparseMatrixCSR(A_cpu)
     LU = copy(A_gpu)
     
-    # Perform the incomplete LU factorization on GPU
+    # Modern CUSPARSE call for ILU0
     CUSPARSE.ilu02!(LU) 
     
     temp_z = CuVector{T}(undef, n)
@@ -23,7 +23,6 @@ function GPUSparseILU(A_cpu::SparseMatrixCSC{T}) where T
 end
 
 function LinearAlgebra.ldiv!(y, P::GPUSparseILU, x)
-    # Lz = x then Uy = z
     ldiv!(P.temp_z, UnitLowerTriangular(P.LU), x)
     ldiv!(y, UpperTriangular(P.LU), P.temp_z)
     return y
@@ -54,12 +53,12 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     b_gpu = CuArray(b_cpu)
 
     # Initialize Plot
-   #= p = plot(title="GMRES Convergence (342k System)", 
+    p = plot(title="GMRES Convergence: 342k Unknowns", 
              xlabel="Iteration", ylabel="Relative Residual",
              yaxis=:log10, label="||r||/||b||", lw=2,
-             marker=:circle, markersize=2)
+             marker=:circle, markersize=2, grid=true)
     display(p)
-=#
+
     println("\nStarting GMRES Solve...")
     
     t_solve = @elapsed begin
@@ -70,14 +69,14 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
                              atol=1e-8, rtol=1e-8,
                              verbose=1,
                              callback = (solver) -> begin
-                                 # SAFE CHECK: Only plot if we have at least 1 residual entry
                                  it = solver.stats.niter
+                                 # Plot every 10 iterations
                                  if it > 0 && it % 10 == 0 && !isempty(solver.stats.residuals)
-                                     # Use the current residual norm divided by initial residual norm
                                      res_norm = solver.stats.residuals[end] / solver.stats.residuals[1]
                                      push!(p, it, res_norm)
                                      gui(p)
                                  end
+                                 return false # CRITICAL: Tells Krylov NOT to stop the solver
                              end)
     end
 
@@ -96,14 +95,12 @@ end
 mode = "readdata" 
 PRECISION = Float64
 
-# Adjust filenames as necessary
 A, b, xt, n_actual = if mode == "readdata"
     load_system_from_files("sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx", PRECISION)
 else
-    # Fallback identity test
-    n_test = 10000
-    I = sparse(1.0I, n_test, n_test)
-    I, ones(n_test), ones(n_test), n_test
+    # Simple Identity test
+    n_t = 5000; I_t = sparse(1.0I, n_t, n_t)
+    I_t, ones(n_t), ones(n_t), n_t
 end
 
 x_final, stats = solve_with_ilu(A, b, xt, PRECISION)
