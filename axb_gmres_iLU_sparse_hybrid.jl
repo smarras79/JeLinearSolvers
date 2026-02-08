@@ -281,14 +281,15 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
                                      push!(iter_data, it)
                                      push!(res_data, Float64(solver.stats.residuals[end]))
                                  end
-                                 # Live plot update every 50 iterations
+                                 # Live plot: overwrite PNG every 50 iterations
+                                 # (monitor with any image viewer that auto-refreshes)
                                  if it > 0 && it % 50 == 0 && length(res_data) >= 2
                                      p_live = plot(iter_data, res_data ./ res_data[1],
-                                                   title="GMRES Convergence (precond: $precond)",
+                                                   title="GMRES iter $it (precond: $precond)",
                                                    xlabel="Iteration", ylabel="Relative Residual",
                                                    yaxis=:log10, label="||r||/||b||", lw=2,
                                                    grid=true, color=:crimson)
-                                     display(p_live)
+                                     savefig(p_live, "convergence_report.png")
                                  end
                                  return false # Continue solving
                              end)
@@ -310,9 +311,9 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
                        xlabel="Iteration", ylabel="Relative Residual",
                        yaxis=:log10, label="||r||/||b||", lw=2,
                        grid=true, color=:crimson)
-        display(p_final)
         savefig(p_final, "convergence_report.png")
         println("Convergence plot saved to convergence_report.png")
+        display(p_final)
     else
         println("Warning: no residual history available for convergence plot.")
     end
@@ -398,3 +399,7 @@ x_final, stats = solve_gmres(A, b, xt, PRECISION; precond=PRECOND)
 
 println("Saving solution to x_out.mtx...")
 MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
+
+# Keep the plot window open until the user closes it
+println("Close the plot window or press Ctrl-C to exit.")
+gui()
