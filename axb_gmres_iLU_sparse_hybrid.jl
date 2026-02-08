@@ -31,6 +31,24 @@ function LinearAlgebra.ldiv!(y, P::GPUSparseILU, x)
     return y
 end
 
+# ===== GPU JACOBI (DIAGONAL) PRECONDITIONER =====
+struct GPUJacobiPrecond{T}
+    dinv::CuVector{T}
+end
+
+function GPUJacobiPrecond(A_cpu::SparseMatrixCSC{T}, PREC) where T
+    d = diag(A_cpu)
+    dinv = PREC(1) ./ d
+    # Guard against zero diagonals
+    dinv[.!isfinite.(dinv)] .= PREC(1)
+    return GPUJacobiPrecond{PREC}(CuArray(Vector{PREC}(dinv)))
+end
+
+function LinearAlgebra.ldiv!(y, P::GPUJacobiPrecond, x)
+    y .= P.dinv .* x
+    return y
+end
+
 # ===== FILE FORMAT DETECTION =====
 function detect_format(filepath)
     if endswith(lowercase(filepath), ".mtx")
@@ -189,11 +207,12 @@ function load_system(path_A, path_b, PREC; path_x=nothing)
     return A, b, xt, n
 end
 
-# ===== MAIN SOLVER WITH PRE-CONDITIONING STRATEGY =====
-function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
+# ===== MAIN SOLVER =====
+# precond: "ilu" | "jacobi" | "none"
+function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
     n = length(b_cpu)
     println("\n" * "="^70)
-    @printf("Robust Solver: %d unknowns | Precision: %s\n", n, PREC)
+    @printf("GMRES Solver: %d unknowns | Precision: %s | Preconditioner: %s\n", n, PREC, precond)
     println("="^70)
 
     # --- 1. GPU TRANSFER ---
@@ -201,24 +220,29 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     A_gpu = CuSparseMatrixCSR(A_cpu)
     b_gpu = CuArray(b_cpu)
 
-    # --- 2. BUILD ILU(0) PRECONDITIONER DIRECTLY ---
-    # Apply CUSPARSE ilu02! on the original matrix (no scaling/shifting).
-    # If ilu02! fails (zero pivot), retry with a minimal diagonal perturbation
-    # applied only to the preconditioner copy — the solve still uses original A.
-    println("Building GPU-Native ILU(0) preconditioner...")
-    P = try
-        GPUSparseILU(A_gpu)
-    catch e
-        @printf("  ILU(0) failed on original matrix: %s\n", e)
-        epsilon = PREC == Float64 ? 1e-10 : PREC(1e-6)
-        @printf("  Retrying with diagonal perturbation eps=%.1e ...\n", epsilon)
-        A_shifted_cpu = A_cpu + epsilon * sparse(PREC(1)*I, n, n)
-        A_shifted_gpu = CuSparseMatrixCSR(A_shifted_cpu)
-        GPUSparseILU(A_shifted_gpu)
+    # --- 2. BUILD PRECONDITIONER ---
+    P = if precond == "ilu"
+        println("Building GPU-Native ILU(0) preconditioner...")
+        try
+            GPUSparseILU(A_gpu)
+        catch e
+            @printf("  ILU(0) failed on original matrix: %s\n", e)
+            epsilon = PREC == Float64 ? 1e-10 : PREC(1e-6)
+            @printf("  Retrying with diagonal perturbation eps=%.1e ...\n", epsilon)
+            A_shifted_cpu = A_cpu + epsilon * sparse(PREC(1)*I, n, n)
+            A_shifted_gpu = CuSparseMatrixCSR(A_shifted_cpu)
+            GPUSparseILU(A_shifted_gpu)
+        end
+    elseif precond == "jacobi"
+        println("Building Jacobi (diagonal) preconditioner...")
+        GPUJacobiPrecond(A_cpu, PREC)
+    else
+        println("No preconditioner.")
+        nothing
     end
 
     # --- 3. LIVE CONVERGENCE PLOTTING ---
-    p = plot(title="GMRES Convergence (ILU(0) preconditioned)",
+    p = plot(title="GMRES Convergence (precond: $precond)",
              xlabel="Iteration", ylabel="Relative Residual",
              yaxis=:log10, label="||r||/||b||", lw=2, grid=true,
              color=:crimson)
@@ -226,9 +250,12 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
 
     println("\nStarting GMRES (Restart Memory=150)...")
 
+    # Build keyword arguments: include M and ldiv only when a preconditioner is used
+    precond_kwargs = P !== nothing ? (M=P, ldiv=true) : (;)
+
     t_solve = @elapsed begin
         x_gpu, stats = gmres(A_gpu, b_gpu;
-                             M=P, ldiv=true,
+                             precond_kwargs...,
                              restart=true, memory=150,
                              itmax=2500,
                              atol=1e-8, rtol=1e-8,
@@ -261,9 +288,14 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
     return x_cpu, stats
 end
 
-# ===== EXECUTION =====
+# ===== ARGUMENT PARSING =====
 # Usage:
-#   julia axb_gmres_iLU_sparse_hybrid.jl <file_A> <file_b> [file_x]
+#   julia axb_gmres_iLU_sparse_hybrid.jl <file_A> <file_b> [file_x] [--precond ilu|jacobi|none]
+#
+# Preconditioner options:
+#   ilu    — GPU-native ILU(0) via CUSPARSE (default)
+#   jacobi — Diagonal (Jacobi) preconditioner
+#   none   — No preconditioner
 #
 # Supported file formats:
 #   - MatrixMarket (.mtx)
@@ -273,14 +305,34 @@ end
 #       Lines starting with '#' or '%' are treated as comments.
 #       0-based indices are auto-detected and shifted to 1-based.
 #
-# If no arguments are given, falls back to a synthetic Laplacian test case.
+# If no file arguments are given, falls back to a synthetic Laplacian test case.
 
+function parse_args(args)
+    positional = String[]
+    precond = "ilu"
+    i = 1
+    while i <= length(args)
+        if args[i] == "--precond" && i + 1 <= length(args)
+            precond = lowercase(args[i+1])
+            i += 2
+        else
+            push!(positional, args[i])
+            i += 1
+        end
+    end
+    if !(precond in ("ilu", "jacobi", "none"))
+        error("Unknown preconditioner: \"$precond\". Choose from: ilu, jacobi, none")
+    end
+    return positional, precond
+end
+
+positional_args, PRECOND = parse_args(ARGS)
 PRECISION = Float64
 
-A, b, xt, n_actual = if length(ARGS) >= 2
-    path_A = ARGS[1]
-    path_b = ARGS[2]
-    path_x = length(ARGS) >= 3 ? ARGS[3] : nothing
+A, b, xt, n_actual = if length(positional_args) >= 2
+    path_A = positional_args[1]
+    path_b = positional_args[2]
+    path_x = length(positional_args) >= 3 ? positional_args[3] : nothing
     load_system(path_A, path_b, PRECISION; path_x=path_x)
 else
     # Laplacian Test Case (fallback when no files are provided)
@@ -293,7 +345,7 @@ else
     sparse(I_idx, J_idx, V_idx, n_t, n_t), ones(PRECISION, n_t), nothing, n_t
 end
 
-x_final, stats = solve_with_ilu(A, b, xt, PRECISION)
+x_final, stats = solve_gmres(A, b, xt, PRECISION; precond=PRECOND)
 
 println("Saving solution to x_out.mtx...")
 MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
