@@ -33,11 +33,11 @@ function load_system_from_files(path_A, path_b, path_x, PREC)
 end
 
 # ===== 3. FLEXIBLE SOLVER FUNCTION =====
-function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres"; PREC=Float64)
+function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres"; PREC=Float64, myepsilon=1e-6)
     n = length(b_cpu)
     
     # Pre-processing: Slightly more aggressive shift for stability
-    epsilon = PREC == Float64 ? 1e-6 : 1f-4 
+    epsilon = PREC == Float64 ? myepsilon : 1f-4 
     println("\nPreprocessing: Scaling & Shift (ϵ = $epsilon)...")
     
     diag_A = diag(A_cpu)
@@ -95,8 +95,11 @@ fA, fb, fx = "sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_
 
 if isfile(fA)
     A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, Float64)
+
+    epsilon = 1e-8
+    
     # Switch to "dqgmres" as it is usually present in older Krylov versions
-    x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres")
+    x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres", myepsilon=epsilon)
     MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
 else
     println("Matrix files not found.")
