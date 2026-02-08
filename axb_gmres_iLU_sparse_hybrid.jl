@@ -257,13 +257,10 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
         nothing
     end
 
-    # --- 3. LIVE CONVERGENCE PLOTTING ---
-    p = plot([0], [1.0],
-             title="GMRES Convergence (precond: $precond)",
-             xlabel="Iteration", ylabel="Relative Residual",
-             yaxis=:log10, label="||r||/||b||", lw=2, grid=true,
-             color=:crimson)
-    display(p)
+    # --- 3. CONVERGENCE TRACKING & SOLVE ---
+    # Collect residual data during solve; update live plot periodically
+    iter_data = Int[]
+    res_data  = Float64[]
 
     println("\nStarting GMRES (Restart Memory=150)...")
 
@@ -280,22 +277,52 @@ function solve_gmres(A_cpu, b_cpu, x_true, PREC; precond="ilu")
                              history=true,
                              callback = (solver) -> begin
                                  it = solver.stats.niter
-                                 if it > 0 && it % 10 == 0 && !isempty(solver.stats.residuals)
-                                     res = solver.stats.residuals[end] / solver.stats.residuals[1]
-                                     push!(p, it, res)
-                                     gui(p)
+                                 if it > 0 && !isempty(solver.stats.residuals)
+                                     push!(iter_data, it)
+                                     push!(res_data, Float64(solver.stats.residuals[end]))
+                                 end
+                                 # Live plot update every 50 iterations
+                                 if it > 0 && it % 50 == 0 && length(res_data) >= 2
+                                     p_live = plot(iter_data, res_data ./ res_data[1],
+                                                   title="GMRES Convergence (precond: $precond)",
+                                                   xlabel="Iteration", ylabel="Relative Residual",
+                                                   yaxis=:log10, label="||r||/||b||", lw=2,
+                                                   grid=true, color=:crimson)
+                                     display(p_live)
                                  end
                                  return false # Continue solving
                              end)
     end
 
-    # --- 4. RECOVER SOLUTION ---
+    # --- 4. FINAL CONVERGENCE PLOT ---
+    # Generate from full residual history (stats.residuals or callback data)
+    r = if !isempty(stats.residuals)
+        Float64.(stats.residuals)
+    elseif !isempty(res_data)
+        res_data
+    else
+        Float64[]
+    end
+    if length(r) >= 2
+        iters = !isempty(stats.residuals) ? (1:length(r)) : iter_data
+        p_final = plot(iters, r ./ r[1],
+                       title="GMRES Convergence (precond: $precond)",
+                       xlabel="Iteration", ylabel="Relative Residual",
+                       yaxis=:log10, label="||r||/||b||", lw=2,
+                       grid=true, color=:crimson)
+        display(p_final)
+        savefig(p_final, "convergence_report.png")
+        println("Convergence plot saved to convergence_report.png")
+    else
+        println("Warning: no residual history available for convergence plot.")
+    end
+
+    # --- 5. RECOVER SOLUTION ---
     x_cpu = if D_equil !== nothing
         D_equil * Array(x_gpu)  # Unscale: x = D * y
     else
         Array(x_gpu)
     end
-    savefig("convergence_report.png")
 
     @printf("\nSolve Time: %.2f s | Iterations: %d\n", t_solve, stats.niter)
     if x_true !== nothing
