@@ -97,9 +97,12 @@ if isfile(fA)
     A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, Float64)
 
     epsilon = 1e-8
+    PREC = Float32
     
     # Switch to "dqgmres" as it is usually present in older Krylov versions
-    x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres", myepsilon=epsilon)
+    x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres";
+                                         PREC=PREC, myepsilon=epsilon)
+    
     MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
 else
     println("Matrix files not found.")
