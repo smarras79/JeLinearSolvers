@@ -385,8 +385,21 @@ println("="^70)
 jacobi_iters = 100  # Increase for better accuracy (10, 50, 100)
 omega = 0.9         # Damping factor (0.7-0.9)
 
-# Determine data source: files or generated problem
-use_files = length(opts.positional) >= 2
+# Determine data source: positional args > default filenames > generated problem
+if length(opts.positional) >= 2
+    file_A = opts.positional[1]
+    file_b = opts.positional[2]
+    file_x = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+elseif isfile("sparse_Abx_data_A.mtx")
+    file_A = "sparse_Abx_data_A.mtx"
+    file_b = "sparse_Abx_data_b.mtx"
+    file_x = isfile("sparse_Abx_data_x.mtx") ? "sparse_Abx_data_x.mtx" : nothing
+else
+    file_A = nothing
+    file_b = nothing
+    file_x = nothing
+end
+use_files = file_A !== nothing
 
 # If user specified --precision, run only that one; otherwise loop over all three
 precision_was_specified = any(a -> a in ("--precision", "-p"), ARGS)
@@ -399,7 +412,7 @@ println("  maxiter: $(opts.maxiter)")
 println("  rtol: $(opts.rtol)")
 println("  Precisions: $precisions_to_run")
 if use_files
-    println("  Input files: ", join(opts.positional, ", "))
+    println("  Input files: $file_A, $file_b", file_x !== nothing ? ", $file_x" : "")
 end
 
 results = Dict()
@@ -408,23 +421,19 @@ for PREC in precisions_to_run
     Random.seed!(42)
 
     if use_files
-        # Load from Matrix Market files: A.mtx b.mtx [x.mtx]
-        path_A = opts.positional[1]
-        path_b = opts.positional[2]
-        isfile(path_A) || error("File not found: $path_A")
-        isfile(path_b) || error("File not found: $path_b")
+        # Load from Matrix Market files
+        isfile(file_A) || error("File not found: $file_A")
+        isfile(file_b) || error("File not found: $file_b")
 
         println("\nLoading Matrix Market files for $PREC ...")
-        A_raw = MatrixMarket.mmread(path_A)
+        A_raw = MatrixMarket.mmread(file_A)
         I_idx, J_idx, V = findnz(A_raw)
         A_cpu = sparse(I_idx, J_idx, Vector{PREC}(V), size(A_raw)...)
-        b_cpu = Vector{PREC}(vec(MatrixMarket.mmread(path_b)))
+        b_cpu = Vector{PREC}(vec(MatrixMarket.mmread(file_b)))
         actual_n = size(A_cpu, 1)
 
-        if length(opts.positional) >= 3
-            path_x = opts.positional[3]
-            isfile(path_x) || error("File not found: $path_x")
-            x_true = Vector{PREC}(vec(MatrixMarket.mmread(path_x)))
+        if file_x !== nothing && isfile(file_x)
+            x_true = Vector{PREC}(vec(MatrixMarket.mmread(file_x)))
         else
             x_true = ones(PREC, actual_n)
         end
@@ -488,7 +497,7 @@ problem_n = first_result.matrix_size
 results_data = Dict(
     "metadata" => Dict(
         "date" => string(Dates.now()),
-        "problem_type" => use_files ? join(opts.positional, ", ") : "convection_diffusion",
+        "problem_type" => use_files ? "$file_A" : "convection_diffusion",
         "problem_size" => problem_n,
         "grid_size" => use_files ? "$(problem_n)" : "$(Int(sqrt(problem_n)))x$(Int(sqrt(problem_n)))",
         "method" => "Fully GPU ILU",
