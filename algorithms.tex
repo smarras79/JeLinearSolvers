@@ -1,0 +1,303 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\cpu}{\textcolor{blue}{\textbf{[CPU]}}}
+\newcommand{\gpu}{\textcolor{red}{\textbf{[GPU]}}}
+\newcommand{\cputogpu}{\textcolor{purple}{\textbf{[CPU$\to$GPU]}}}
+
+\title{Algorithms and Computational Architecture\\
+       in \texttt{axb\_gmres\_iLU\_sparse\_full\_gpu.jl}}
+\author{JeLinearSolvers Documentation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+%----------------------------------------------------------------------
+\section{Overview}
+
+The solver in \texttt{axb\_gmres\_iLU\_sparse\_full\_gpu.jl} solves
+sparse linear systems $Ax = b$ using preconditioned GMRES with an
+Incomplete LU (ILU) preconditioner.  Its distinguishing feature is that
+\emph{all} GMRES iteration work---including preconditioner
+application---executes on the GPU.  The triangular solves required by
+the ILU preconditioner are replaced by damped Jacobi iterations, which
+are fully parallelizable on GPU hardware.
+
+The solver supports mixed-precision arithmetic
+(\texttt{Float64}, \texttt{Float32}, \texttt{Float16}) and includes
+automatic fallback to a diagonal (Jacobi) preconditioner when the
+iterative triangular solve diverges.
+
+%----------------------------------------------------------------------
+\section{Outer Solver: Restarted GMRES}
+
+The outer Krylov solver is restarted GMRES (Generalized Minimal
+Residual method), provided by the \texttt{Krylov.jl} library.  Given
+$A \in \mathbb{R}^{n \times n}$ and $b \in \mathbb{R}^n$, GMRES
+constructs an orthonormal basis for the Krylov subspace
+\[
+  \mathcal{K}_m(A,r_0) = \operatorname{span}\{r_0,\, Ar_0,\, A^2 r_0,\, \ldots,\, A^{m-1}r_0\},
+\]
+where $r_0 = b - Ax_0$ is the initial residual, and finds $x_m$ that
+minimizes $\|b - Ax_m\|_2$ over $x_0 + \mathcal{K}_m$.
+
+\begin{algorithm}[H]
+\caption{Right-Preconditioned Restarted GMRES}
+\label{alg:gmres}
+\begin{algorithmic}[1]
+\Require $A$, $b$, preconditioner $M \approx A^{-1}$, restart length $m$, tolerance $\epsilon$
+\State $x_0 \gets 0$
+\Repeat
+  \State $r \gets b - Ax_0$                          \hfill \gpu
+  \State Build orthonormal basis $V_m$ of $\mathcal{K}_m(AM^{-1},\, r)$ via Arnoldi
+                                                      \hfill \gpu
+  \State Solve least-squares: $y_m = \arg\min_y \|r - AM^{-1}V_m y\|_2$
+                                                      \hfill \gpu
+  \State $x_0 \gets x_0 + M^{-1}V_m y_m$            \hfill \gpu
+\Until{$\|b - Ax_0\|_2 / \|b\|_2 < \epsilon$ or iteration limit reached}
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+\textbf{Key parameters} (all configurable via command-line arguments):
+\begin{itemize}
+  \item \texttt{--maxiter} ($k_{\max}$): maximum number of GMRES iterations (default: 200).
+  \item \texttt{--rtol} ($\epsilon$): relative convergence tolerance (default: $10^{-8}$).
+        Both \texttt{atol} and \texttt{rtol} are set to $T(\epsilon)$,
+        where $T$ is the working precision.
+  \item \texttt{--precision} ($T$): floating-point type---\texttt{Float64} (default),
+        \texttt{Float32}, or \texttt{Float16}.
+\end{itemize}
+
+All matrix--vector products $v \mapsto Av$ and preconditioner
+applications $v \mapsto M^{-1}v$ inside GMRES execute entirely on the
+GPU; no data is transferred between CPU and GPU during the iteration.
+
+%----------------------------------------------------------------------
+\section{Preconditioners}
+\label{sec:preconditioners}
+
+Two preconditioners are available.  The primary one is a fully
+GPU-resident ILU preconditioner; the secondary one is a diagonal
+(Jacobi) preconditioner used as a fallback.
+
+%----------------------------------------------------------------------
+\subsection{Primary: Fully GPU ILU Preconditioner}
+
+\subsubsection{ILU Factorization (CPU)}
+
+The incomplete LU factorization is computed on the CPU using the
+\texttt{IncompleteLU.jl} package.  Given the system matrix $A$, the
+factorization produces sparse lower- and upper-triangular factors $L$
+and $U$ such that
+\[
+  A \approx LU,
+\]
+where entries of $L$ and $U$ with magnitude below a drop tolerance
+$\tau$ are discarded.  The default drop tolerance is $\tau = 0.01$.
+
+\begin{itemize}
+  \item Setting $\tau = 0$ retains \emph{all} fill-in, producing a
+        full LU factorization in $O(n^3)$ time---this must be avoided
+        for large matrices.
+  \item Larger $\tau$ yields sparser factors (faster preconditioner
+        application) at the cost of a less accurate approximation to $A$.
+\end{itemize}
+
+If the ILU factorization fails (e.g., due to a singular or
+near-singular matrix), the code falls back to a diagonal
+preconditioner $M = D^{1/2} D^{1/2}$ where
+$D = \operatorname{diag}(|A|)$.
+
+\subsubsection{Diagonal Regularization}
+
+After factorization, the diagonals of $L$ and $U$ are inspected. The
+$L$ factor from \texttt{IncompleteLU.jl} has an \emph{implicit} unit
+diagonal (the 1s are not stored in the sparse structure).  Any
+near-zero diagonal entry $|d_i| < 1000\,\varepsilon_T$ (where
+$\varepsilon_T$ = machine epsilon of precision $T$) is corrected to
+$1.0$.  This is performed efficiently via:
+\begin{enumerate}
+  \item Extract diagonal vectors using \texttt{diag()} --- a single
+        $O(\texttt{nnz})$ pass.
+  \item Compute a correction vector and apply it as a sparse diagonal
+        addition: $L_{\text{fixed}} = L + \operatorname{spdiagm}(\Delta_L)$.
+\end{enumerate}
+This avoids element-by-element mutation of the compressed sparse column
+(CSC) structure, which would require $O(n \cdot \texttt{nnz})$ array
+shifts.
+
+\subsubsection{GPU Transfer}
+
+The corrected factors $L$ and $U$ are transferred to GPU memory as
+\texttt{CuSparseMatrixCSC} objects.  The precomputed inverse diagonal
+vectors $D_L^{-1}$ and $D_U^{-1}$ are transferred as dense
+\texttt{CuVector}s.  After this one-time transfer, no further
+CPU$\leftrightarrow$GPU communication occurs during the solve.
+
+\subsubsection{Approximate Triangular Solve via Damped Jacobi Iteration (GPU)}
+
+Standard triangular solves ($L^{-1}v$ and $U^{-1}v$) are inherently
+sequential and poorly suited to GPU execution.  This solver replaces
+them with \textbf{damped Jacobi iterations}, which consist entirely of
+sparse matrix--vector products and element-wise vector operations---both
+of which are highly parallel on GPUs.
+
+To solve $Ly = x$ where $L = D_L + L_{\text{strict}}$ (diagonal plus
+strictly lower-triangular part):
+
+\begin{algorithm}[H]
+\caption{Damped Jacobi Iteration for $Ly = x$ \gpu}
+\label{alg:jacobi-lower}
+\begin{algorithmic}[1]
+\Require Sparse $L$ on GPU, $D_L^{-1}$ on GPU, right-hand side $x$, iterations $k_J$, damping $\omega$
+\State $y^{(0)} \gets D_L^{-1} \odot x$ \Comment{element-wise multiply}
+\For{$k = 1, \ldots, k_J$}
+  \State $t \gets x - L\, y^{(k-1)}$              \Comment{SpMV on GPU}
+  \State $y^{(k)} \gets (1 - \omega)\, y^{(k-1)} + \omega\, (D_L^{-1} \odot t)$
+         \Comment{element-wise on GPU}
+\EndFor
+\State \Return $y^{(k_J)}$
+\end{algorithmic}
+\end{algorithm}
+
+An identical iteration is used for the upper-triangular solve $Uy = x$
+with $D_U^{-1}$.
+
+\medskip
+\noindent
+\textbf{Preconditioner application} (solving $(LU)^{-1}v$):
+\begin{enumerate}
+  \item Forward solve: $z \gets L^{-1}v$\quad via Algorithm~\ref{alg:jacobi-lower} \hfill\gpu
+  \item Backward solve: $y \gets U^{-1}z$\quad via damped Jacobi on $U$ \hfill\gpu
+\end{enumerate}
+
+\noindent
+\textbf{Parameters:}
+\begin{itemize}
+  \item $k_J = 100$ (Jacobi iterations per triangular solve).  Higher
+        values improve accuracy but slow down each preconditioner
+        application.
+  \item $\omega = 0.9$ (damping factor).  Values in $[0.7, 0.9]$ are
+        typical; $\omega = 1$ is undamped Jacobi.
+\end{itemize}
+
+\noindent
+\textbf{Convergence requirement:}  The Jacobi iteration converges if and
+only if the spectral radius
+$\rho(I - \omega D_L^{-1} L) < 1$.  This holds for diagonally dominant
+triangular matrices but is \emph{not} guaranteed for arbitrary matrices.
+A runtime test (applying the preconditioner to a vector of ones) detects
+divergence (NaN/Inf), and the solver automatically falls back to the
+diagonal preconditioner described below.
+
+%----------------------------------------------------------------------
+\subsection{Fallback: Diagonal (Jacobi) Preconditioner}
+
+When the GPU ILU preconditioner test fails, the solver constructs a
+simple diagonal preconditioner:
+\[
+  M^{-1} v = d \odot v, \qquad d_i =
+  \begin{cases}
+    1 / A_{ii} & \text{if } |A_{ii}| > \varepsilon_T, \\
+    1           & \text{otherwise},
+  \end{cases}
+\]
+where $d$ is stored as a \texttt{CuVector} on the GPU.  The
+preconditioner is wrapped as a \texttt{LinearOperator} so that
+\texttt{Krylov.jl} can apply it without the \texttt{ldiv!} interface.
+
+This preconditioner is cheap (one element-wise multiply per application)
+and always numerically stable, but provides less iteration reduction
+than ILU for ill-conditioned systems.
+
+%----------------------------------------------------------------------
+\section{CPU vs.\ GPU Execution Map}
+
+Table~\ref{tab:cpugpu} summarizes where each computational phase
+executes.
+
+\begin{table}[H]
+\centering
+\caption{Execution location of each phase in the solver pipeline.}
+\label{tab:cpugpu}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Phase} & \textbf{CPU} & \textbf{GPU} \\
+\midrule
+Load/generate matrix $A$, $b$              & \checkmark &            \\
+ILU factorization ($A \approx LU$, $\tau = 0.01$)
+                                           & \checkmark &            \\
+Diagonal regularization of $L$, $U$        & \checkmark &            \\
+Transfer $A$, $b$, $L$, $U$, $D_L^{-1}$, $D_U^{-1}$ to GPU
+                                           & \multicolumn{2}{c}{CPU $\to$ GPU} \\
+\midrule
+GMRES Arnoldi process (mat-vec $Av$)       &            & \checkmark \\
+GMRES orthogonalization and least-squares  &            & \checkmark \\
+Preconditioner: SpMV ($Ly$, $Uy$)          &            & \checkmark \\
+Preconditioner: Jacobi vector updates      &            & \checkmark \\
+Convergence check                          &            & \checkmark \\
+\midrule
+Copy solution $x$ back to CPU              & \multicolumn{2}{c}{GPU $\to$ CPU} \\
+Error computation $\|x - x_{\text{true}}\|/\|x_{\text{true}}\|$
+                                           & \checkmark &            \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{Key design principle:} Once the ILU factors and the system
+matrix are transferred to the GPU, the entire GMRES iteration
+(including every preconditioner application) runs on the GPU with
+\emph{zero} CPU--GPU data transfers.  This contrasts with the hybrid
+approach in \texttt{axb\_gmres\_iLU\_sparse\_hybrid.jl}, where the ILU
+factors remain on the CPU and vectors are transferred back and forth at
+every preconditioner application.
+
+%----------------------------------------------------------------------
+\section{Mixed-Precision Support}
+
+The solver supports three IEEE floating-point formats:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Type} & \textbf{Bits} & \textbf{Machine $\varepsilon$} & \textbf{Significand digits} \\
+\midrule
+\texttt{Float64} & 64 & $2.2 \times 10^{-16}$ & $\sim$15--16 \\
+\texttt{Float32} & 32 & $1.2 \times 10^{-7}$  & $\sim$7--8   \\
+\texttt{Float16} & 16 & $9.8 \times 10^{-4}$  & $\sim$3--4   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+All matrices, vectors, solver tolerances, and preconditioner data are
+cast to the selected precision $T$.  When no \texttt{--precision}
+argument is given, the solver loops over all three precisions for a
+comparative study.
+
+%----------------------------------------------------------------------
+\section{Complete Solver Pipeline}
+
+\begin{enumerate}
+  \item \cpu\ Load or generate $A \in \mathbb{R}^{n \times n}$ and $b \in \mathbb{R}^n$.
+  \item \cpu\ Compute ILU: $(L, U) \gets \texttt{ilu}(A,\, \tau{=}0.01)$.
+  \item \cpu\ Regularize diagonals of $L$ and $U$; compute $D_L^{-1}$, $D_U^{-1}$.
+  \item \cputogpu\ Transfer $A$, $b$, $L$, $U$, $D_L^{-1}$, $D_U^{-1}$ to GPU.
+  \item \gpu\ Test preconditioner on $e = (1,1,\ldots,1)^T$; if NaN/Inf, switch to diagonal preconditioner.
+  \item \gpu\ Solve $Ax = b$ with unpreconditioned GMRES (baseline).
+  \item \gpu\ Solve $Ax = b$ with preconditioned GMRES (ILU or diagonal fallback).
+  \item Report iteration counts, timings, and relative errors.
+\end{enumerate}
+
+\end{document}

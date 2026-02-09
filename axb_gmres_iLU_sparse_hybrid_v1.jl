@@ -1,8 +1,10 @@
 using SparseArrays, LinearAlgebra, Random, Printf, Dates
 using CUDA, CUDA.CUSPARSE
-using Krylov 
+using Krylov
 using MatrixMarket
 using Plots
+
+include("cli_args.jl")
 
 # ===== 1. PRECONDITIONER SETUP =====
 struct GPUSparseILU{T}
@@ -33,7 +35,8 @@ function load_system_from_files(path_A, path_b, path_x, PREC)
 end
 
 # ===== 3. FLEXIBLE SOLVER FUNCTION =====
-function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres"; PREC=Float64, myepsilon=1e-6)
+function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres";
+                             PREC=Float64, myepsilon=1e-6, maxiter::Int=3000, rtol::Float64=1e-8)
     n = length(b_cpu)
     
     # Pre-processing: Slightly more aggressive shift for stability
@@ -69,13 +72,17 @@ function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres"; PREC=F
         end
 
         # DISPATCH LOGIC
+        solve_rtol = PREC(rtol)
         y_gpu, stats = if solver_type == "gmres"
-            Krylov.gmres(A_gpu, b_gpu; M=P, ldiv=true, restart=true, memory=100, itmax=2000, callback=cb, verbose=1)
+            Krylov.gmres(A_gpu, b_gpu; M=P, ldiv=true, restart=true, memory=100,
+                         itmax=maxiter, rtol=solve_rtol, callback=cb, verbose=1)
         elseif solver_type == "bicgstab"
-            Krylov.bicgstab(A_gpu, b_gpu; M=P, ldiv=true, itmax=3000, callback=cb, verbose=1)
+            Krylov.bicgstab(A_gpu, b_gpu; M=P, ldiv=true,
+                            itmax=maxiter, rtol=solve_rtol, callback=cb, verbose=1)
         elseif solver_type == "dqgmres"
             # DQGMRES is very stable for large systems
-            Krylov.dqgmres(A_gpu, b_gpu; M=P, ldiv=true, memory=100, itmax=3000, callback=cb, verbose=1)
+            Krylov.dqgmres(A_gpu, b_gpu; M=P, ldiv=true, memory=100,
+                           itmax=maxiter, rtol=solve_rtol, callback=cb, verbose=1)
         else
             error("Solver $solver_type not available or not recognized.")
         end
@@ -91,19 +98,40 @@ function solve_linear_system(A_cpu, b_cpu, x_true, solver_type="dqgmres"; PREC=F
 end
 
 # ===== 4. EXECUTION =====
-fA, fb, fx = "sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx"
+opts = parse_commandline_args(; default_maxiter=3000, default_rtol=1e-8, default_precision=Float64)
+
+# Determine file paths: from CLI positional args, or fall back to defaults
+if length(opts.positional) >= 2
+    fA = opts.positional[1]
+    fb = opts.positional[2]
+    fx = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+else
+    fA = "sparse_Abx_data_A.mtx"
+    fb = "sparse_Abx_data_b.mtx"
+    fx = "sparse_Abx_data_x.mtx"
+end
 
 if isfile(fA)
-    A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, Float64)
+    isfile(fb) || error("File not found: $fb")
+    if fx !== nothing
+        isfile(fx) || error("File not found: $fx")
+        A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, opts.precision)
+    else
+        A_raw = MatrixMarket.mmread(fA)
+        I_idx, J_idx, V = findnz(A_raw)
+        A_orig = sparse(I_idx, J_idx, Vector{opts.precision}(V), size(A_raw)...)
+        b_orig = Vector{opts.precision}(vec(MatrixMarket.mmread(fb)))
+        xt_orig = zeros(opts.precision, size(A_orig, 1))
+    end
 
     epsilon = 1e-8
-    PREC = Float32
-    
-    # Switch to "dqgmres" as it is usually present in older Krylov versions
+
     x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres";
-                                         PREC=PREC, myepsilon=epsilon)
-    
+                                         PREC=opts.precision, myepsilon=epsilon,
+                                         maxiter=opts.maxiter, rtol=opts.rtol)
+
     MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
 else
-    println("Matrix files not found.")
+    println("Matrix file not found: $fA")
+    println("Usage: julia --project=. $(PROGRAM_FILE) [options] A.mtx b.mtx [x.mtx]")
 end

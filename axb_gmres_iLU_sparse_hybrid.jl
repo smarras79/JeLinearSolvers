@@ -1,8 +1,10 @@
 using SparseArrays, LinearAlgebra, Random, Printf, Dates
 using CUDA, CUDA.CUSPARSE
-using Krylov 
+using Krylov
 using MatrixMarket
 using Plots
+
+include("cli_args.jl")
 
 # ===== ROBUST NATIVE GPU ILU PRECONDITIONER =====
 struct GPUSparseILU{T}
@@ -46,10 +48,10 @@ function load_system_from_files(path_A, path_b, path_x, PREC)
 end
 
 # ===== MAIN SOLVER WITH PRE-CONDITIONING STRATEGY =====
-function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
+function solve_with_ilu(A_cpu, b_cpu, x_true, PREC; maxiter::Int=2500, rtol::Float64=1e-8)
     n = length(b_cpu)
     println("\n" * "="^70)
-    @printf("Robust Solver: %d unknowns | Precision: %s\n", n, PREC)
+    @printf("Robust Solver: %d unknowns | Precision: %s | maxiter: %d | rtol: %.1e\n", n, PREC, maxiter, rtol)
     println("="^70)
 
     # --- 1. PRE-PROCESSING (Scaling and Shift) ---
@@ -80,15 +82,16 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
              color=:crimson)
     display(p)
 
-    println("\nStarting GMRES (Restart Memory=150)...")
-    
+    rtol_prec = PREC(rtol)
+    println("\nStarting GMRES (Restart Memory=150, itmax=$maxiter, rtol=$rtol_prec)...")
+
     t_solve = @elapsed begin
         # We solve the scaled system: (D A D) y = (D b)
-        y_gpu, stats = gmres(A_gpu, b_gpu; 
-                             M=P, ldiv=true, 
-                             restart=true, memory=150, 
-                             itmax=2500, 
-                             atol=1e-8, rtol=1e-8,
+        y_gpu, stats = gmres(A_gpu, b_gpu;
+                             M=P, ldiv=true,
+                             restart=true, memory=150,
+                             itmax=maxiter,
+                             atol=rtol_prec, rtol=rtol_prec,
                              verbose=1,
                              callback = (solver) -> begin
                                  it = solver.stats.niter
@@ -116,13 +119,36 @@ function solve_with_ilu(A_cpu, b_cpu, x_true, PREC)
 end
 
 # ===== EXECUTION =====
-mode = "readdata" 
-PRECISION = Float64
+opts = parse_commandline_args(; default_maxiter=2500, default_rtol=1e-8, default_precision=Float64)
+PRECISION = opts.precision
 
-A, b, xt, n_actual = if mode == "readdata"
-    load_system_from_files("sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx", PRECISION)
+# Determine file paths: from CLI positional args, or fall back to defaults / generated problem
+if length(opts.positional) >= 2
+    path_A = opts.positional[1]
+    path_b = opts.positional[2]
+    path_x = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+elseif isfile("sparse_Abx_data_A.mtx")
+    path_A = "sparse_Abx_data_A.mtx"
+    path_b = "sparse_Abx_data_b.mtx"
+    path_x = "sparse_Abx_data_x.mtx"
 else
-    # Laplacian Test Case
+    path_A = nothing
+    path_b = nothing
+    path_x = nothing
+end
+
+A, b, xt, n_actual = if path_A !== nothing
+    isfile(path_A) || error("File not found: $path_A")
+    isfile(path_b) || error("File not found: $path_b")
+    A_loaded, b_loaded, xt_loaded, n_loaded = load_system_from_files(path_A, path_b, path_x !== nothing ? path_x : path_b, PRECISION)
+    if path_x !== nothing
+        A_loaded, b_loaded, xt_loaded, n_loaded
+    else
+        # No true solution file — use zero placeholder
+        A_loaded, b_loaded, zeros(PRECISION, n_loaded), n_loaded
+    end
+else
+    println("No matrix files found. Using generated Laplacian test case.")
     nx = 585; n_t = nx^2
     I_idx, J_idx, V_idx = Int[], Int[], PRECISION[]
     for i in 1:n_t
@@ -131,7 +157,7 @@ else
     sparse(I_idx, J_idx, V_idx, n_t, n_t), ones(PRECISION, n_t), ones(PRECISION, n_t), n_t
 end
 
-x_final, stats = solve_with_ilu(A, b, xt, PRECISION)
+x_final, stats = solve_with_ilu(A, b, xt, PRECISION; maxiter=opts.maxiter, rtol=opts.rtol)
 
 println("Saving solution to x_out.mtx...")
 MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))

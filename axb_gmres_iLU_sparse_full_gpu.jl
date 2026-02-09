@@ -1,9 +1,12 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
-using IncompleteLU, Krylov
+using IncompleteLU, Krylov, LinearOperators
 using Printf
 using Dates
 using JSON
+using MatrixMarket
+
+include("cli_args.jl")
 
 # ===== CREATE REALISTIC TEST PROBLEM =====
 function create_convection_diffusion(n, PREC)
@@ -99,29 +102,25 @@ struct FullyGPUILU{T,TM}
     omega::T               # Relaxation parameter
 end
 
-function FullyGPUILU(L_cpu::SparseMatrixCSC{T}, U_cpu::SparseMatrixCSC{T}; 
+function FullyGPUILU(L_cpu::SparseMatrixCSC{T}, U_cpu::SparseMatrixCSC{T};
                      jacobi_iters=100, omega=T(0.9)) where T
     n = size(L_cpu, 1)
-    
-    # Fix any zero diagonals
-    L_fixed = copy(L_cpu)
-    U_fixed = copy(U_cpu)
-    
-    for i in 1:n
-        if abs(L_fixed[i,i]) < eps(T) * 1000
-            L_fixed[i,i] = T(1.0)
-        end
-        if abs(U_fixed[i,i]) < eps(T) * 1000
-            U_fixed[i,i] = T(1.0)
-        end
-    end
-    
-    # Extract diagonals on CPU
-    L_diag_cpu = [L_fixed[i,i] for i in 1:n]
-    U_diag_cpu = [U_fixed[i,i] for i in 1:n]
-    L_diag_inv_cpu = T(1) ./ L_diag_cpu
-    U_diag_inv_cpu = T(1) ./ U_diag_cpu
-    
+    threshold = eps(T) * T(1000)
+
+    # Extract diagonals efficiently (single O(nnz) pass each)
+    L_diag = diag(L_cpu)
+    U_diag = diag(U_cpu)
+
+    # Fix near-zero diagonals via sparse addition (no element-by-element mutation)
+    L_fix = [abs(d) < threshold ? T(1.0) - d : T(0.0) for d in L_diag]
+    U_fix = [abs(d) < threshold ? T(1.0) - d : T(0.0) for d in U_diag]
+    L_fixed = any(!iszero, L_fix) ? L_cpu + spdiagm(0 => L_fix) : L_cpu
+    U_fixed = any(!iszero, U_fix) ? U_cpu + spdiagm(0 => U_fix) : U_cpu
+
+    # Compute inverse diagonals from the corrected values
+    L_diag_inv_cpu = T(1) ./ (L_diag .+ L_fix)
+    U_diag_inv_cpu = T(1) ./ (U_diag .+ U_fix)
+
     # Transfer to GPU as sparse
     L_gpu = CuSparseMatrixCSC(L_fixed)
     U_gpu = CuSparseMatrixCSC(U_fixed)
@@ -197,11 +196,12 @@ function LinearAlgebra.ldiv!(y, P::FullyGPUILU, x)
 end
 
 # ===== MIXED PRECISION ILU SOLVER =====
-function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
+function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
+                            maxiter::Int=200, rtol::Float64=1e-8)
     n = length(b_cpu)
-    
+
     println("\n" * "="^70)
-    println("PRECISION: $PREC")
+    println("PRECISION: $PREC | maxiter: $maxiter | rtol: $rtol")
     println("="^70)
     
     nnz_A = SparseArrays.nnz(A_cpu)
@@ -213,15 +213,18 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     println("  Density: $(round(density, digits=2))%")
     
     # ===== COMPUTE ILU FACTORIZATION (on CPU) =====
-    println("\nComputing ILU(0) factorization on CPU...")
-    
+    # τ controls drop tolerance: entries below τ are dropped from L,U
+    # τ=0.0 keeps ALL fill-in (essentially full LU, hangs on large matrices)
+    ilu_tau = PREC(0.01)
+    println("\nComputing ILU factorization on CPU (τ=$ilu_tau)...")
+
     L_cpu, U_cpu = try
-        fact = ilu(A_cpu, τ=PREC(0.0))
+        fact = ilu(A_cpu, τ=ilu_tau)
         fact.L, fact.U
     catch e
-        println("  ⚠ ILU failed: $e, using diagonal preconditioner")
-        D = [abs(A_cpu[i,i]) > eps(PREC) ? A_cpu[i,i] : PREC(1.0) for i in 1:n]
-        D_sqrt = sqrt.(abs.(D))
+        println("  WARNING: ILU failed: $e, using diagonal preconditioner")
+        d_vals = diag(A_cpu)
+        D_sqrt = sqrt.(max.(abs.(d_vals), eps(PREC)))
         sparse(Diagonal(D_sqrt)), sparse(Diagonal(D_sqrt))
     end
     
@@ -236,39 +239,46 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     println("\nTransferring to GPU...")
     A_gpu = CuSparseMatrixCSC(A_cpu)
     b_gpu = CuArray(b_cpu)
-    
-    # Build fully GPU ILU preconditioner
+
+    # Build GPU ILU preconditioner; fall back to diagonal if Jacobi iteration diverges
+    println("\nBuilding GPU ILU preconditioner...")
     P = FullyGPUILU(L_cpu, U_cpu, jacobi_iters=jacobi_iters, omega=omega)
-    
-    println("  ✓ Fully GPU ILU preconditioner built")
+
     println("  - L, U: sparse on GPU")
     println("  - Triangular solve: Damped Jacobi ($jacobi_iters iters, ω=$omega)")
-    println("  - All operations on GPU during solve")
-    
-    # Test preconditioner
-    println("\nTesting GPU preconditioner...")
+
+    # Test preconditioner — Jacobi triangular solve can diverge for some matrices
     test_x = CuArray(ones(PREC, n))
     test_y = similar(test_x)
     ldiv!(test_y, P, test_x)
     test_result = Array(test_y)
-    
+
+    use_ilu = true
     if any(isnan.(test_result)) || any(isinf.(test_result))
-        error("GPU Preconditioner produces NaN/Inf")
+        println("  WARNING: GPU ILU preconditioner produces NaN/Inf (Jacobi iteration diverged)")
+        println("  Falling back to diagonal (Jacobi) preconditioner...")
+        # Simple diagonal preconditioner: M = diag(A)^{-1}
+        a_diag = diag(A_cpu)
+        d_cpu = [abs(v) > eps(PREC) ? PREC(1) / v : PREC(1) for v in a_diag]
+        d_gpu = CuArray(d_cpu)
+        # Wrap as a LinearOperator so Krylov.jl can use it
+        use_ilu = false
+    else
+        println("  ✓ GPU ILU preconditioner test passed")
     end
-    println("  ✓ GPU preconditioner test passed")
     
     # ===== SOLVE WITHOUT PRECONDITIONER =====
     println("\n[1/2] Solving WITHOUT preconditioner...")
-    
-    atol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
-    rtol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
-    
+
+    solve_atol = PREC(rtol)
+    solve_rtol = PREC(rtol)
+
     CUDA.@sync t_noprecond = @elapsed begin
-        x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu; 
-                                              atol=atol,
-                                              rtol=rtol,
+        x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu;
+                                              atol=solve_atol,
+                                              rtol=solve_rtol,
                                               restart=true,
-                                              itmax=200,
+                                              itmax=maxiter,
                                               verbose=0,
                                               history=true)
     end
@@ -284,19 +294,37 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     println("  Relative error: $(err_noprecond)")
     println("  Converged: $(stats_noprecond.solved)")
     
-    # ===== SOLVE WITH GPU ILU PRECONDITIONER =====
-    println("\n[2/2] Solving WITH fully GPU ILU preconditioner...")
-    
+    # ===== SOLVE WITH PRECONDITIONER =====
+    if use_ilu
+        println("\n[2/2] Solving WITH fully GPU ILU preconditioner...")
+    else
+        println("\n[2/2] Solving WITH diagonal preconditioner (ILU diverged)...")
+    end
+
     CUDA.@sync t_ilu = @elapsed begin
-        x_ilu, stats_ilu = gmres(A_gpu, b_gpu; 
-                                 M=P,
-                                 ldiv=true,
-                                 atol=atol,
-                                 rtol=rtol,
-                                 restart=true,
-                                 itmax=200,
-                                 verbose=0,
-                                 history=true)
+        if use_ilu
+            x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
+                                     M=P,
+                                     ldiv=true,
+                                     atol=solve_atol,
+                                     rtol=solve_rtol,
+                                     restart=true,
+                                     itmax=maxiter,
+                                     verbose=0,
+                                     history=true)
+        else
+            # Diagonal preconditioner: M*x = diag(A)^{-1} * x
+            opM = LinearOperator(PREC, n, n, true, true,
+                                 (y, v) -> (y .= d_gpu .* v))
+            x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
+                                     M=opM,
+                                     atol=solve_atol,
+                                     rtol=solve_rtol,
+                                     restart=true,
+                                     itmax=maxiter,
+                                     verbose=0,
+                                     history=true)
+        end
     end
     
     x_ilu_cpu = Array(x_ilu)
@@ -347,35 +375,83 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
 end
 
 # ===== MAIN: MIXED PRECISION STUDY =====
+opts = parse_commandline_args(; default_maxiter=200, default_rtol=1e-8, default_precision=Float64)
+
 println("="^70)
 println("FULLY GPU ILU PRECONDITIONING - MIXED PRECISION STUDY")
 println("="^70)
-
-n = 10000  # 100×100 grid
-problem_type = "convection_diffusion"  # or "laplacian"
 
 # GPU-specific parameters
 jacobi_iters = 100  # Increase for better accuracy (10, 50, 100)
 omega = 0.9         # Damping factor (0.7-0.9)
 
+# Determine data source: positional args > default filenames > generated problem
+if length(opts.positional) >= 2
+    file_A = opts.positional[1]
+    file_b = opts.positional[2]
+    file_x = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+elseif isfile("sparse_Abx_data_A.mtx")
+    file_A = "sparse_Abx_data_A.mtx"
+    file_b = "sparse_Abx_data_b.mtx"
+    file_x = isfile("sparse_Abx_data_x.mtx") ? "sparse_Abx_data_x.mtx" : nothing
+else
+    file_A = nothing
+    file_b = nothing
+    file_x = nothing
+end
+use_files = file_A !== nothing
+
+# If user specified --precision, run only that one; otherwise loop over all three
+precision_was_specified = any(a -> a in ("--precision", "-p"), ARGS)
+precisions_to_run = precision_was_specified ? [opts.precision] : [Float64, Float32, Float16]
+
 println("\nGPU Solver Parameters:")
 println("  Jacobi iterations: $jacobi_iters")
 println("  Omega (damping): $omega")
+println("  maxiter: $(opts.maxiter)")
+println("  rtol: $(opts.rtol)")
+println("  Precisions: $precisions_to_run")
+if use_files
+    println("  Input files: $file_A, $file_b", file_x !== nothing ? ", $file_x" : "")
+end
 
 results = Dict()
 
-for PREC in [Float64, Float32, Float16]
+for PREC in precisions_to_run
     Random.seed!(42)
-    
-    if problem_type == "laplacian"
-        A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+
+    if use_files
+        # Load from Matrix Market files
+        isfile(file_A) || error("File not found: $file_A")
+        isfile(file_b) || error("File not found: $file_b")
+
+        println("\nLoading Matrix Market files for $PREC ...")
+        A_raw = MatrixMarket.mmread(file_A)
+        I_idx, J_idx, V = findnz(A_raw)
+        A_cpu = sparse(I_idx, J_idx, Vector{PREC}(V), size(A_raw)...)
+        b_cpu = Vector{PREC}(vec(MatrixMarket.mmread(file_b)))
+        actual_n = size(A_cpu, 1)
+
+        if file_x !== nothing && isfile(file_x)
+            x_true = Vector{PREC}(vec(MatrixMarket.mmread(file_x)))
+        else
+            x_true = ones(PREC, actual_n)
+        end
     else
-        A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+        # Generate test problem
+        n = 10000  # 100x100 grid
+        problem_type = "convection_diffusion"
+        if problem_type == "laplacian"
+            A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+        else
+            A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+        end
     end
-    
-    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega))
+
+    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega);
+                                maxiter=opts.maxiter, rtol=opts.rtol)
     results[PREC] = result
-    
+
     println()
 end
 
@@ -390,7 +466,7 @@ header = @sprintf("%-12s %10s %10s %10s %10s %10s",
 println(header)
 println("-"^70)
 
-for PREC in [Float64, Float32, Float16]
+for PREC in precisions_to_run
     r = results[PREC]
     row = @sprintf("%-12s %10d %10d %10.2fx %10.2f %10.2e",
                    PREC,
@@ -416,12 +492,14 @@ println("GENERATING PDF REPORT...")
 println("="^70)
 
 # Prepare data for Python PDF generation
+first_result = first(values(results))
+problem_n = first_result.matrix_size
 results_data = Dict(
     "metadata" => Dict(
         "date" => string(Dates.now()),
-        "problem_type" => problem_type,
-        "problem_size" => n,
-        "grid_size" => "$(Int(sqrt(n)))×$(Int(sqrt(n)))",
+        "problem_type" => use_files ? "$file_A" : "convection_diffusion",
+        "problem_size" => problem_n,
+        "grid_size" => use_files ? "$(problem_n)" : "$(Int(sqrt(problem_n)))x$(Int(sqrt(problem_n)))",
         "method" => "Fully GPU ILU",
         "jacobi_iters" => jacobi_iters,
         "omega" => omega
