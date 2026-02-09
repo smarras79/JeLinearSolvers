@@ -1,6 +1,6 @@
 using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
-using IncompleteLU, Krylov
+using IncompleteLU, Krylov, LinearOperators
 using Printf
 using Dates
 using JSON
@@ -222,9 +222,9 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
         fact = ilu(A_cpu, τ=ilu_tau)
         fact.L, fact.U
     catch e
-        println("  ⚠ ILU failed: $e, using diagonal preconditioner")
-        D = [abs(A_cpu[i,i]) > eps(PREC) ? A_cpu[i,i] : PREC(1.0) for i in 1:n]
-        D_sqrt = sqrt.(abs.(D))
+        println("  WARNING: ILU failed: $e, using diagonal preconditioner")
+        d_vals = diag(A_cpu)
+        D_sqrt = sqrt.(max.(abs.(d_vals), eps(PREC)))
         sparse(Diagonal(D_sqrt)), sparse(Diagonal(D_sqrt))
     end
     
@@ -239,26 +239,33 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
     println("\nTransferring to GPU...")
     A_gpu = CuSparseMatrixCSC(A_cpu)
     b_gpu = CuArray(b_cpu)
-    
-    # Build fully GPU ILU preconditioner
+
+    # Build GPU ILU preconditioner; fall back to diagonal if Jacobi iteration diverges
+    println("\nBuilding GPU ILU preconditioner...")
     P = FullyGPUILU(L_cpu, U_cpu, jacobi_iters=jacobi_iters, omega=omega)
-    
-    println("  ✓ Fully GPU ILU preconditioner built")
+
     println("  - L, U: sparse on GPU")
     println("  - Triangular solve: Damped Jacobi ($jacobi_iters iters, ω=$omega)")
-    println("  - All operations on GPU during solve")
-    
-    # Test preconditioner
-    println("\nTesting GPU preconditioner...")
+
+    # Test preconditioner — Jacobi triangular solve can diverge for some matrices
     test_x = CuArray(ones(PREC, n))
     test_y = similar(test_x)
     ldiv!(test_y, P, test_x)
     test_result = Array(test_y)
-    
+
+    use_ilu = true
     if any(isnan.(test_result)) || any(isinf.(test_result))
-        error("GPU Preconditioner produces NaN/Inf")
+        println("  WARNING: GPU ILU preconditioner produces NaN/Inf (Jacobi iteration diverged)")
+        println("  Falling back to diagonal (Jacobi) preconditioner...")
+        # Simple diagonal preconditioner: M = diag(A)^{-1}
+        a_diag = diag(A_cpu)
+        d_cpu = [abs(v) > eps(PREC) ? PREC(1) / v : PREC(1) for v in a_diag]
+        d_gpu = CuArray(d_cpu)
+        # Wrap as a LinearOperator so Krylov.jl can use it
+        use_ilu = false
+    else
+        println("  ✓ GPU ILU preconditioner test passed")
     end
-    println("  ✓ GPU preconditioner test passed")
     
     # ===== SOLVE WITHOUT PRECONDITIONER =====
     println("\n[1/2] Solving WITHOUT preconditioner...")
@@ -287,19 +294,37 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
     println("  Relative error: $(err_noprecond)")
     println("  Converged: $(stats_noprecond.solved)")
     
-    # ===== SOLVE WITH GPU ILU PRECONDITIONER =====
-    println("\n[2/2] Solving WITH fully GPU ILU preconditioner...")
-    
+    # ===== SOLVE WITH PRECONDITIONER =====
+    if use_ilu
+        println("\n[2/2] Solving WITH fully GPU ILU preconditioner...")
+    else
+        println("\n[2/2] Solving WITH diagonal preconditioner (ILU diverged)...")
+    end
+
     CUDA.@sync t_ilu = @elapsed begin
-        x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
-                                 M=P,
-                                 ldiv=true,
-                                 atol=solve_atol,
-                                 rtol=solve_rtol,
-                                 restart=true,
-                                 itmax=maxiter,
-                                 verbose=0,
-                                 history=true)
+        if use_ilu
+            x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
+                                     M=P,
+                                     ldiv=true,
+                                     atol=solve_atol,
+                                     rtol=solve_rtol,
+                                     restart=true,
+                                     itmax=maxiter,
+                                     verbose=0,
+                                     history=true)
+        else
+            # Diagonal preconditioner: M*x = diag(A)^{-1} * x
+            opM = LinearOperator(PREC, n, n, true, true,
+                                 (y, v) -> (y .= d_gpu .* v))
+            x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
+                                     M=opM,
+                                     atol=solve_atol,
+                                     rtol=solve_rtol,
+                                     restart=true,
+                                     itmax=maxiter,
+                                     verbose=0,
+                                     history=true)
+        end
     end
     
     x_ilu_cpu = Array(x_ilu)
