@@ -2,7 +2,7 @@
 # Shared utility for all solver scripts.
 # Usage: include("cli_args.jl")
 #        opts = parse_commandline_args()
-#        # opts.maxiter, opts.rtol, opts.precision
+#        # opts.maxiter, opts.rtol, opts.precision, opts.positional
 
 const PRECISION_MAP = Dict(
     "float64" => Float64,
@@ -15,19 +15,24 @@ const PRECISION_MAP = Dict(
 
 Parse command line arguments for the linear solver scripts.
 
+Returns a NamedTuple with fields: maxiter, rtol, precision, positional.
+Positional arguments (e.g. file paths) are collected into `positional`.
+
 Supported arguments:
   --maxiter, -m N          Maximum solver iterations
   --rtol, -r VAL           Relative convergence tolerance
   --precision, -p TYPE     Floating-point precision: Float64, Float32, or Float16
   --help, -h               Print usage and exit
+  <file1> <file2> ...      Positional arguments (e.g. matrix file paths)
 """
 function parse_commandline_args(args=ARGS;
                                 default_maxiter::Int = 2500,
                                 default_rtol::Float64 = 1e-8,
                                 default_precision::DataType = Float64)
-    maxiter   = default_maxiter
-    rtol      = default_rtol
-    precision = default_precision
+    maxiter    = default_maxiter
+    rtol       = default_rtol
+    precision  = default_precision
+    positional = String[]
 
     i = 1
     while i <= length(args)
@@ -49,7 +54,7 @@ function parse_commandline_args(args=ARGS;
             precision = PRECISION_MAP[key]
             i += 2
         elseif arg in ("--help", "-h")
-            println("Usage: julia [--project=.] script.jl [options]")
+            println("Usage: julia [--project=.] script.jl [options] [file1.mtx file2.mtx ...]")
             println()
             println("Options:")
             println("  --maxiter, -m N       Maximum solver iterations (default: $default_maxiter)")
@@ -57,11 +62,17 @@ function parse_commandline_args(args=ARGS;
             println("  --precision, -p TYPE  Precision: Float64, Float32, Float16 (default: $default_precision)")
             println("  --help, -h            Show this help message")
             exit(0)
+        elseif startswith(arg, "-")
+            error("Unknown option: '$arg'. Use --help for usage information.")
         else
-            error("Unknown argument: '$arg'. Use --help for usage information.")
+            push!(positional, arg)
+            i += 1
         end
     end
 
     println("CLI arguments: maxiter=$maxiter, rtol=$rtol, precision=$precision")
-    return (maxiter=maxiter, rtol=rtol, precision=precision)
+    if !isempty(positional)
+        println("Positional args: ", join(positional, ", "))
+    end
+    return (maxiter=maxiter, rtol=rtol, precision=precision, positional=positional)
 end
