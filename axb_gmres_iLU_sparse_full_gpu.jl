@@ -217,10 +217,13 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
     println("  Density: $(round(density, digits=2))%")
     
     # ===== COMPUTE ILU FACTORIZATION (on CPU) =====
-    println("\nComputing ILU(0) factorization on CPU...")
-    
+    # τ controls drop tolerance: entries below τ are dropped from L,U
+    # τ=0.0 keeps ALL fill-in (essentially full LU, hangs on large matrices)
+    ilu_tau = PREC(0.01)
+    println("\nComputing ILU factorization on CPU (τ=$ilu_tau)...")
+
     L_cpu, U_cpu = try
-        fact = ilu(A_cpu, τ=PREC(0.0))
+        fact = ilu(A_cpu, τ=ilu_tau)
         fact.L, fact.U
     catch e
         println("  ⚠ ILU failed: $e, using diagonal preconditioner")
