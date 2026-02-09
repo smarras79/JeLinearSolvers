@@ -120,13 +120,35 @@ end
 
 # ===== EXECUTION =====
 opts = parse_commandline_args(; default_maxiter=2500, default_rtol=1e-8, default_precision=Float64)
-mode = "readdata"
 PRECISION = opts.precision
 
-A, b, xt, n_actual = if mode == "readdata"
-    load_system_from_files("sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx", PRECISION)
+# Determine file paths: from CLI positional args, or fall back to defaults / generated problem
+if length(opts.positional) >= 2
+    path_A = opts.positional[1]
+    path_b = opts.positional[2]
+    path_x = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+elseif isfile("sparse_Abx_data_A.mtx")
+    path_A = "sparse_Abx_data_A.mtx"
+    path_b = "sparse_Abx_data_b.mtx"
+    path_x = "sparse_Abx_data_x.mtx"
 else
-    # Laplacian Test Case
+    path_A = nothing
+    path_b = nothing
+    path_x = nothing
+end
+
+A, b, xt, n_actual = if path_A !== nothing
+    isfile(path_A) || error("File not found: $path_A")
+    isfile(path_b) || error("File not found: $path_b")
+    A_loaded, b_loaded, xt_loaded, n_loaded = load_system_from_files(path_A, path_b, path_x !== nothing ? path_x : path_b, PRECISION)
+    if path_x !== nothing
+        A_loaded, b_loaded, xt_loaded, n_loaded
+    else
+        # No true solution file — use zero placeholder
+        A_loaded, b_loaded, zeros(PRECISION, n_loaded), n_loaded
+    end
+else
+    println("No matrix files found. Using generated Laplacian test case.")
     nx = 585; n_t = nx^2
     I_idx, J_idx, V_idx = Int[], Int[], PRECISION[]
     for i in 1:n_t

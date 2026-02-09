@@ -100,19 +100,38 @@ end
 # ===== 4. EXECUTION =====
 opts = parse_commandline_args(; default_maxiter=3000, default_rtol=1e-8, default_precision=Float64)
 
-fA, fb, fx = "sparse_Abx_data_A.mtx", "sparse_Abx_data_b.mtx", "sparse_Abx_data_x.mtx"
+# Determine file paths: from CLI positional args, or fall back to defaults
+if length(opts.positional) >= 2
+    fA = opts.positional[1]
+    fb = opts.positional[2]
+    fx = length(opts.positional) >= 3 ? opts.positional[3] : nothing
+else
+    fA = "sparse_Abx_data_A.mtx"
+    fb = "sparse_Abx_data_b.mtx"
+    fx = "sparse_Abx_data_x.mtx"
+end
 
 if isfile(fA)
-    A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, opts.precision)
+    isfile(fb) || error("File not found: $fb")
+    if fx !== nothing
+        isfile(fx) || error("File not found: $fx")
+        A_orig, b_orig, xt_orig = load_system_from_files(fA, fb, fx, opts.precision)
+    else
+        A_raw = MatrixMarket.mmread(fA)
+        I_idx, J_idx, V = findnz(A_raw)
+        A_orig = sparse(I_idx, J_idx, Vector{opts.precision}(V), size(A_raw)...)
+        b_orig = Vector{opts.precision}(vec(MatrixMarket.mmread(fb)))
+        xt_orig = zeros(opts.precision, size(A_orig, 1))
+    end
 
     epsilon = 1e-8
 
-    # Switch to "dqgmres" as it is usually present in older Krylov versions
     x_final, stats = solve_linear_system(A_orig, b_orig, xt_orig, "dqgmres";
                                          PREC=opts.precision, myepsilon=epsilon,
                                          maxiter=opts.maxiter, rtol=opts.rtol)
 
     MatrixMarket.mmwrite("x_out.mtx", sparse(reshape(x_final, :, 1)))
 else
-    println("Matrix files not found.")
+    println("Matrix file not found: $fA")
+    println("Usage: julia --project=. $(PROGRAM_FILE) [options] A.mtx b.mtx [x.mtx]")
 end
