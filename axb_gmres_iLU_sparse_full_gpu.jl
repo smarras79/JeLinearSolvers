@@ -354,12 +354,20 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
     else
         println("⚠ ILU did not reduce iterations")
     end
-    
+
+    res_noprecond = stats_noprecond.residuals
+    res_ilu = stats_ilu.residuals
+
     return (
         noprecond_iters = stats_noprecond.niter,
         noprecond_time = t_noprecond,
         noprecond_error = err_noprecond,
         noprecond_converged = stats_noprecond.solved,
+        
+        # NEW: Add these two lines
+        noprecond_history = res_noprecond,
+        ilu_history = res_ilu,
+
         ilu_iters = stats_ilu.niter,
         ilu_time = t_ilu,
         ilu_error = err_ilu,
@@ -372,6 +380,7 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
         jacobi_iters = jacobi_iters,
         omega = omega
     )
+    
 end
 
 # ===== MAIN: MIXED PRECISION STUDY =====
@@ -504,14 +513,20 @@ results_data = Dict(
         "jacobi_iters" => jacobi_iters,
         "omega" => omega
     ),
+
     "results" => Dict(
         string(PREC) => Dict(
             "noprecond_iters" => r.noprecond_iters,
-            "noprecond_time" => r.noprecond_time * 1000,  # Convert to ms
+            "noprecond_time" => r.noprecond_time * 1000,
             "noprecond_error" => r.noprecond_error,
             "noprecond_converged" => r.noprecond_converged,
+            
+            # NEW: Add history arrays (convert to standard Arrays for JSON serialization)
+            "noprecond_history" => r.noprecond_history,
+            "ilu_history" => r.ilu_history,
+
             "ilu_iters" => r.ilu_iters,
-            "ilu_time" => r.ilu_time * 1000,  # Convert to ms
+            "ilu_time" => r.ilu_time * 1000,
             "ilu_error" => r.ilu_error,
             "ilu_converged" => r.ilu_converged,
             "iter_reduction" => r.iter_reduction,
