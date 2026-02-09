@@ -1,5 +1,14 @@
 #!/bin/bash
 # Combined script to run ILU study and generate PDF report
+#
+# Usage: ./run_study_with_pdf.sh [options]
+#   --maxiter, -m N       Maximum solver iterations (default: 2500)
+#   --rtol, -r VAL        Relative convergence tolerance (default: 1e-8)
+#   --precision, -p TYPE  Precision: Float64, Float32, Float16 (default: Float64)
+#
+# Examples:
+#   ./run_study_with_pdf.sh --maxiter 5000 --rtol 1e-10 --precision Float32
+#   ./run_study_with_pdf.sh -m 1000 -r 1e-6 -p Float64
 
 echo "======================================================================"
 echo "Mixed Precision ILU Preconditioning Study with PDF Report Generation"
@@ -14,11 +23,11 @@ if [ $? -ne 0 ]; then
     pip install reportlab matplotlib numpy --break-system-packages --quiet
 fi
 
-# Run Julia simulation
+# Run Julia simulation (pass through all CLI arguments)
 echo ""
 echo "Step 1: Running Julia simulation..."
 echo "----------------------------------------------------------------------"
-julia --project=. ./axb_gmres_iLU_sparse_hybrid.jl
+julia --project=. ./axb_gmres_iLU_sparse_hybrid.jl "$@"
 
 # Check if Julia completed successfully
 if [ $? -ne 0 ]; then

@@ -5,6 +5,8 @@ using Printf
 using Dates
 using JSON
 
+include("cli_args.jl")
+
 # ===== CREATE REALISTIC TEST PROBLEM =====
 function create_convection_diffusion(n, PREC)
     """Convection-diffusion: harder problem that benefits from ILU"""
@@ -197,11 +199,12 @@ function LinearAlgebra.ldiv!(y, P::FullyGPUILU, x)
 end
 
 # ===== MIXED PRECISION ILU SOLVER =====
-function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
+function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega;
+                            maxiter::Int=200, rtol::Float64=1e-8)
     n = length(b_cpu)
-    
+
     println("\n" * "="^70)
-    println("PRECISION: $PREC")
+    println("PRECISION: $PREC | maxiter: $maxiter | rtol: $rtol")
     println("="^70)
     
     nnz_A = SparseArrays.nnz(A_cpu)
@@ -259,16 +262,16 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     
     # ===== SOLVE WITHOUT PRECONDITIONER =====
     println("\n[1/2] Solving WITHOUT preconditioner...")
-    
-    atol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
-    rtol = PREC == Float64 ? 1e-8 : PREC == Float32 ? 1f-6 : Float16(1e-3)
-    
+
+    solve_atol = PREC(rtol)
+    solve_rtol = PREC(rtol)
+
     CUDA.@sync t_noprecond = @elapsed begin
-        x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu; 
-                                              atol=atol,
-                                              rtol=rtol,
+        x_noprecond, stats_noprecond = gmres(A_gpu, b_gpu;
+                                              atol=solve_atol,
+                                              rtol=solve_rtol,
                                               restart=true,
-                                              itmax=200,
+                                              itmax=maxiter,
                                               verbose=0,
                                               history=true)
     end
@@ -288,13 +291,13 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
     println("\n[2/2] Solving WITH fully GPU ILU preconditioner...")
     
     CUDA.@sync t_ilu = @elapsed begin
-        x_ilu, stats_ilu = gmres(A_gpu, b_gpu; 
+        x_ilu, stats_ilu = gmres(A_gpu, b_gpu;
                                  M=P,
                                  ldiv=true,
-                                 atol=atol,
-                                 rtol=rtol,
+                                 atol=solve_atol,
+                                 rtol=solve_rtol,
                                  restart=true,
-                                 itmax=200,
+                                 itmax=maxiter,
                                  verbose=0,
                                  history=true)
     end
@@ -347,35 +350,45 @@ function solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, omega)
 end
 
 # ===== MAIN: MIXED PRECISION STUDY =====
+opts = parse_commandline_args(; default_maxiter=200, default_rtol=1e-8, default_precision=Float64)
+
 println("="^70)
 println("FULLY GPU ILU PRECONDITIONING - MIXED PRECISION STUDY")
 println("="^70)
 
-n = 10000  # 100×100 grid
+n = 10000  # 100x100 grid
 problem_type = "convection_diffusion"  # or "laplacian"
 
 # GPU-specific parameters
 jacobi_iters = 100  # Increase for better accuracy (10, 50, 100)
 omega = 0.9         # Damping factor (0.7-0.9)
 
+# If user specified --precision, run only that one; otherwise loop over all three
+precision_was_specified = any(a -> a in ("--precision", "-p"), ARGS)
+precisions_to_run = precision_was_specified ? [opts.precision] : [Float64, Float32, Float16]
+
 println("\nGPU Solver Parameters:")
 println("  Jacobi iterations: $jacobi_iters")
 println("  Omega (damping): $omega")
+println("  maxiter: $(opts.maxiter)")
+println("  rtol: $(opts.rtol)")
+println("  Precisions: $precisions_to_run")
 
 results = Dict()
 
-for PREC in [Float64, Float32, Float16]
+for PREC in precisions_to_run
     Random.seed!(42)
-    
+
     if problem_type == "laplacian"
         A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
     else
         A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
     end
-    
-    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega))
+
+    result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega);
+                                maxiter=opts.maxiter, rtol=opts.rtol)
     results[PREC] = result
-    
+
     println()
 end
 
@@ -390,7 +403,7 @@ header = @sprintf("%-12s %10s %10s %10s %10s %10s",
 println(header)
 println("-"^70)
 
-for PREC in [Float64, Float32, Float16]
+for PREC in precisions_to_run
     r = results[PREC]
     row = @sprintf("%-12s %10d %10d %10.2fx %10.2f %10.2e",
                    PREC,

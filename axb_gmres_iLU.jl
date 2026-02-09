@@ -2,9 +2,12 @@ using SparseArrays, LinearAlgebra, Random
 using CUDA, CUDA.CUSPARSE
 using IncompleteLU, Krylov
 
-# ===== SET PRECISION HERE =====
-const PREC = Float32
-# ==============================
+include("cli_args.jl")
+
+# ===== PARSE CLI ARGUMENTS =====
+opts = parse_commandline_args(; default_maxiter=100, default_rtol=1e-6, default_precision=Float64)
+PREC = opts.precision
+# ================================
 
 Random.seed!(42)
 n = 100
@@ -70,19 +73,20 @@ println("\nBuilding sparse ILU preconditioner (hybrid CPU/GPU)...")
 P = SparseILUPreconditioner(ilu_fact.L, ilu_fact.U)
 
 # Solve
-atol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
-rtol = PREC == Float64 ? 1e-6 : PREC == Float32 ? 1f-6 : Float16(1e-4)
+solve_rtol = PREC(opts.rtol)
+solve_atol = PREC(opts.rtol)
 
 println("\nSolving with sparse ILU-preconditioned GMRES...")
 println("(ILU stored sparse on CPU, matrix-vector on GPU)")
+println("  maxiter=$(opts.maxiter), rtol=$solve_rtol")
 
-x_gpu, stats = gmres(A_gpu, b_gpu; 
-                     M=P, 
+x_gpu, stats = gmres(A_gpu, b_gpu;
+                     M=P,
                      ldiv=true,
-                     atol=atol,
-                     rtol=rtol,
+                     atol=solve_atol,
+                     rtol=solve_rtol,
                      restart=true,
-                     itmax=100,
+                     itmax=opts.maxiter,
                      verbose=1,
                      history=true)
 
