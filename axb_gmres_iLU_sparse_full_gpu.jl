@@ -4,6 +4,7 @@ using IncompleteLU, Krylov
 using Printf
 using Dates
 using JSON
+using MatrixMarket
 
 include("cli_args.jl")
 
@@ -356,12 +357,12 @@ println("="^70)
 println("FULLY GPU ILU PRECONDITIONING - MIXED PRECISION STUDY")
 println("="^70)
 
-n = 10000  # 100x100 grid
-problem_type = "convection_diffusion"  # or "laplacian"
-
 # GPU-specific parameters
 jacobi_iters = 100  # Increase for better accuracy (10, 50, 100)
 omega = 0.9         # Damping factor (0.7-0.9)
+
+# Determine data source: files or generated problem
+use_files = length(opts.positional) >= 2
 
 # If user specified --precision, run only that one; otherwise loop over all three
 precision_was_specified = any(a -> a in ("--precision", "-p"), ARGS)
@@ -373,16 +374,45 @@ println("  Omega (damping): $omega")
 println("  maxiter: $(opts.maxiter)")
 println("  rtol: $(opts.rtol)")
 println("  Precisions: $precisions_to_run")
+if use_files
+    println("  Input files: ", join(opts.positional, ", "))
+end
 
 results = Dict()
 
 for PREC in precisions_to_run
     Random.seed!(42)
 
-    if problem_type == "laplacian"
-        A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+    if use_files
+        # Load from Matrix Market files: A.mtx b.mtx [x.mtx]
+        path_A = opts.positional[1]
+        path_b = opts.positional[2]
+        isfile(path_A) || error("File not found: $path_A")
+        isfile(path_b) || error("File not found: $path_b")
+
+        println("\nLoading Matrix Market files for $PREC ...")
+        A_raw = MatrixMarket.mmread(path_A)
+        I_idx, J_idx, V = findnz(A_raw)
+        A_cpu = sparse(I_idx, J_idx, Vector{PREC}(V), size(A_raw)...)
+        b_cpu = Vector{PREC}(vec(MatrixMarket.mmread(path_b)))
+        actual_n = size(A_cpu, 1)
+
+        if length(opts.positional) >= 3
+            path_x = opts.positional[3]
+            isfile(path_x) || error("File not found: $path_x")
+            x_true = Vector{PREC}(vec(MatrixMarket.mmread(path_x)))
+        else
+            x_true = ones(PREC, actual_n)
+        end
     else
-        A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+        # Generate test problem
+        n = 10000  # 100x100 grid
+        problem_type = "convection_diffusion"
+        if problem_type == "laplacian"
+            A_cpu, b_cpu, x_true, actual_n = create_2d_laplacian(n, PREC)
+        else
+            A_cpu, b_cpu, x_true, actual_n = create_convection_diffusion(n, PREC)
+        end
     end
 
     result = solve_with_gpu_ilu(A_cpu, b_cpu, x_true, PREC, jacobi_iters, PREC(omega);
@@ -429,12 +459,14 @@ println("GENERATING PDF REPORT...")
 println("="^70)
 
 # Prepare data for Python PDF generation
+first_result = first(values(results))
+problem_n = first_result.matrix_size
 results_data = Dict(
     "metadata" => Dict(
         "date" => string(Dates.now()),
-        "problem_type" => problem_type,
-        "problem_size" => n,
-        "grid_size" => "$(Int(sqrt(n)))×$(Int(sqrt(n)))",
+        "problem_type" => use_files ? join(opts.positional, ", ") : "convection_diffusion",
+        "problem_size" => problem_n,
+        "grid_size" => use_files ? "$(problem_n)" : "$(Int(sqrt(problem_n)))x$(Int(sqrt(problem_n)))",
         "method" => "Fully GPU ILU",
         "jacobi_iters" => jacobi_iters,
         "omega" => omega

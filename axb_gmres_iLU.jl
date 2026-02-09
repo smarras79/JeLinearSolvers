@@ -63,53 +63,35 @@ nnz_U = SparseArrays.nnz(ilu_fact.U)
 println("ILU sparsity: L has $nnz_L nnz, U has $nnz_U nnz (vs $(n*n) for dense)")
 # =======================================
 
-# Fix zero diagonals in L and U to prevent SingularException
-L_cpu = copy(ilu_fact.L)
-U_cpu = copy(ilu_fact.U)
-for i in 1:n
-    if abs(L_cpu[i,i]) < eps(PREC) * 1000
-        L_cpu[i,i] = PREC(1.0)
-    end
-    if abs(U_cpu[i,i]) < eps(PREC) * 1000
-        U_cpu[i,i] = PREC(1.0)
-    end
-end
-
 # Transfer to GPU
 A_gpu = CuSparseMatrixCSR(A_cpu)
 b_gpu = CuArray(b_cpu)
 
 # Sparse ILU Preconditioner - Hybrid CPU/GPU approach
 # ILU factors stay sparse on CPU, only vectors transferred
-struct SparseILUPreconditioner{T,TL,TU}
-    L_cpu::TL  # Sparse L on CPU
-    U_cpu::TU  # Sparse U on CPU
+struct SparseILUPreconditioner{T,TF}
+    ilu_fact::TF
     temp_cpu::Vector{T}
 end
 
-function SparseILUPreconditioner(L_cpu::TL, U_cpu::TU) where {T,TL<:SparseMatrixCSC{T},TU<:SparseMatrixCSC{T}}
-    n = size(L_cpu, 1)
-    SparseILUPreconditioner{T,TL,TU}(L_cpu, U_cpu, Vector{T}(undef, n))
+function SparseILUPreconditioner(ilu_fact, ::Type{T}, n::Int) where T
+    SparseILUPreconditioner{T, typeof(ilu_fact)}(ilu_fact, Vector{T}(undef, n))
 end
 
 function LinearAlgebra.ldiv!(y, P::SparseILUPreconditioner, x)
     # Transfer GPU -> CPU (only vectors, not matrices)
     x_cpu = Array(x)
 
-    # Sparse triangular solves on CPU (fast for sparse L, U)
-    # Forward solve: L \ x
-    ldiv!(P.temp_cpu, LowerTriangular(P.L_cpu), x_cpu)
-
-    # Backward solve: U \ temp
-    y_cpu = UpperTriangular(P.U_cpu) \ P.temp_cpu
+    # Use IncompleteLU's own ldiv! which handles L (unit lower) and U correctly
+    ldiv!(P.temp_cpu, P.ilu_fact, x_cpu)
 
     # Transfer CPU -> GPU
-    copyto!(y, y_cpu)
+    copyto!(y, P.temp_cpu)
     return y
 end
 
 println("\nBuilding sparse ILU preconditioner (hybrid CPU/GPU)...")
-P = SparseILUPreconditioner(L_cpu, U_cpu)
+P = SparseILUPreconditioner(ilu_fact, PREC, n)
 
 # Solve
 solve_rtol = PREC(opts.rtol)
