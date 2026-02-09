@@ -102,29 +102,25 @@ struct FullyGPUILU{T,TM}
     omega::T               # Relaxation parameter
 end
 
-function FullyGPUILU(L_cpu::SparseMatrixCSC{T}, U_cpu::SparseMatrixCSC{T}; 
+function FullyGPUILU(L_cpu::SparseMatrixCSC{T}, U_cpu::SparseMatrixCSC{T};
                      jacobi_iters=100, omega=T(0.9)) where T
     n = size(L_cpu, 1)
-    
-    # Fix any zero diagonals
-    L_fixed = copy(L_cpu)
-    U_fixed = copy(U_cpu)
-    
-    for i in 1:n
-        if abs(L_fixed[i,i]) < eps(T) * 1000
-            L_fixed[i,i] = T(1.0)
-        end
-        if abs(U_fixed[i,i]) < eps(T) * 1000
-            U_fixed[i,i] = T(1.0)
-        end
-    end
-    
-    # Extract diagonals on CPU
-    L_diag_cpu = [L_fixed[i,i] for i in 1:n]
-    U_diag_cpu = [U_fixed[i,i] for i in 1:n]
-    L_diag_inv_cpu = T(1) ./ L_diag_cpu
-    U_diag_inv_cpu = T(1) ./ U_diag_cpu
-    
+    threshold = eps(T) * T(1000)
+
+    # Extract diagonals efficiently (single O(nnz) pass each)
+    L_diag = diag(L_cpu)
+    U_diag = diag(U_cpu)
+
+    # Fix near-zero diagonals via sparse addition (no element-by-element mutation)
+    L_fix = [abs(d) < threshold ? T(1.0) - d : T(0.0) for d in L_diag]
+    U_fix = [abs(d) < threshold ? T(1.0) - d : T(0.0) for d in U_diag]
+    L_fixed = any(!iszero, L_fix) ? L_cpu + spdiagm(0 => L_fix) : L_cpu
+    U_fixed = any(!iszero, U_fix) ? U_cpu + spdiagm(0 => U_fix) : U_cpu
+
+    # Compute inverse diagonals from the corrected values
+    L_diag_inv_cpu = T(1) ./ (L_diag .+ L_fix)
+    U_diag_inv_cpu = T(1) ./ (U_diag .+ U_fix)
+
     # Transfer to GPU as sparse
     L_gpu = CuSparseMatrixCSC(L_fixed)
     U_gpu = CuSparseMatrixCSC(U_fixed)
